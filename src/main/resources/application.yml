@@ -1,0 +1,23 @@
+spring:
+  application:
+    name: cdp-test-demo
+
+server:
+  port: 8080
+
+# ─── 应用配置 ─────────────────────────────────────────────
+app:
+  # 运行模式: api (Web 服务) | cli (启动时自动搜索 + Web 服务)
+  mode: api
+
+  chrome:
+    # Chrome 远程调试端口
+    port: 9222
+    # Chrome 可执行文件路径
+    executable: C:/Program Files/Google/Chrome/Application/chrome.exe
+
+  search:
+    # 默认搜索关键词
+    query: "魔法少女小圆"
+    # 默认返回条数
+    count: 10

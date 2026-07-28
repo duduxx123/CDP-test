@@ -1,0 +1,27 @@
+# Maven
+target/
+*.jar
+*.war
+*.class
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+
+# Claude
+.claude/
+CLAUDE.md

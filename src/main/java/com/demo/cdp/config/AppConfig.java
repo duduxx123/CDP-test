@@ -1,0 +1,16 @@
+package com.demo.cdp.config;
+
+import org.springframework.boot.context.properties.ConfigurationProperties;
+
+/**
+ * 集中管理应用配置，支持 IDEA 中直接编辑 application.yml。
+ */
+@ConfigurationProperties(prefix = "app")
+public record AppConfig(
+        String mode,
+        Chrome chrome,
+        Search search
+) {
+    public record Chrome(int port, String executable) {}
+    public record Search(String query, int count) {}
+}
