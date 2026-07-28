@@ -9,8 +9,10 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 public record AppConfig(
         String mode,
         Chrome chrome,
-        Search search
+        Search search,
+        Douyin douyin
 ) {
     public record Chrome(int port, String executable) {}
     public record Search(String query, int count) {}
+    public record Douyin(boolean checkLogin, int typingDelayMs, int maxScrollRounds) {}
 }

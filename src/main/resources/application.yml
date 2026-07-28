@@ -21,3 +21,11 @@ app:
     query: "魔法少女小圆"
     # 默认返回条数
     count: 10
+
+  douyin:
+    # 发表评论前检查登录状态
+    check-login: true
+    # 模拟人类打字延迟基准值（毫秒）
+    typing-delay-ms: 100
+    # 评论提取最大滚动轮数
+    max-scroll-rounds: 20
