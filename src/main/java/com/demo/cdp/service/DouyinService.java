@@ -17,10 +17,7 @@ import java.util.Set;
 /**
  * 抖音网页版自动操作 —— 搜索 + 点指定视频 + 评论。
  * <p>
- * 复用 {@link ChromeLifecycleService} 的 CDP 连接，与 Bing/YouTube 共用同一个 Chrome 浏览器实例。
- * <p>
- * 抖音网页版使用 React SPA + CSS Modules（动态哈希类名），因此全部 DOM 操作采用
- * <b>多策略降级选择器 + JS evaluate 注入</b> 方式实现，并配套调试方法辅助排查。
+ * 优先使用 Playwright locator API，JS evaluate 仅用于调试和无法用选择器表达的逻辑。
  */
 @Service
 public class DouyinService {
@@ -33,41 +30,14 @@ public class DouyinService {
         this.chromeService = chromeService;
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // 记录类型
-    // ═══════════════════════════════════════════════════════════
+    // ════ 记录类型 ════
 
-    /**
-     * 评论操作结果。
-     */
-    public record DouyinResult(boolean success, String videoTitle, String videoUrl, String comment) {
-    }
+    public record DouyinResult(boolean success, String videoTitle, String videoUrl, String comment) {}
+    public record CommentItem(String author, String text, String time) {}
+    public record CommentsResult(boolean success, String videoTitle, String videoUrl, List<CommentItem> comments) {}
 
-    /**
-     * 单条评论数据。
-     */
-    public record CommentItem(String author, String text, String time) {
-    }
+    // ════ 公共方法 ════
 
-    /**
-     * 评论获取结果。
-     */
-    public record CommentsResult(boolean success, String videoTitle, String videoUrl,
-                                 List<CommentItem> comments) {
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // 公共方法
-    // ═══════════════════════════════════════════════════════════
-
-    /**
-     * 搜索抖音关键词，点进第 index 个视频并发表评论。
-     *
-     * @param keyword 搜索关键词
-     * @param comment 要发表的评论内容
-     * @param index   选择第几个视频（1-based，默认 1）
-     * @return 操作结果
-     */
     public DouyinResult searchAndComment(String keyword, String comment, int index) {
         int videoIndex = Math.max(1, index);
         Browser browser = chromeService.getBrowser();
@@ -75,50 +45,30 @@ public class DouyinService {
         Page page = context.newPage();
 
         try {
-            // ─── 1. 搜索 ───
             searchDouyin(page, keyword);
-
-            // ─── 2. 点击第 index 个视频 ───
-            String videoUrl = clickVideoByIndex(page, videoIndex);
-
-            // ─── 3. 等待视频页加载 ───
-            waitForVideoPage(page);
-            String title = page.title();
-            log.info("🎬 视频标题: {}", title);
-
-            // ─── 4. 检查登录状态 ───
-            if (!isLoggedIn(page)) {
-                log.warn("⚠️ 未登录抖音，无法评论");
-                return new DouyinResult(false, page.title(),
-                        page.url(), "(未登录抖音，请先在 Chrome 中登录 douyin.com)");
+            if (isVerificationPage(page)) {
+                return new DouyinResult(false, "(验证码拦截)", page.url(), comment);
             }
-
-            // ─── 5. 滚动到评论区 ───
+            String videoUrl = clickVideoByIndex(page, videoIndex);
+            waitForVideoPage(page);
+            if (isVerificationPage(page)) {
+                return new DouyinResult(false, "(验证码拦截)", page.url(), comment);
+            }
+            if (!isLoggedIn(page)) {
+                return new DouyinResult(false, page.title(), page.url(), "(未登录)");
+            }
             scrollToComments(page);
-
-            // ─── 6. 发表评论 ───
             postComment(page, comment);
-
             log.info("✅ 抖音评论完成: {} → {}", videoUrl, comment);
-            return new DouyinResult(true, title, videoUrl, comment);
-
+            return new DouyinResult(true, page.title(), videoUrl, comment);
         } catch (Exception e) {
             log.error("❌ 抖音操作失败: {}", e.getMessage(), e);
             return new DouyinResult(false, "(操作失败)", "", comment);
-
         } finally {
             log.info("📌 标签页保持打开，可手动查看");
         }
     }
 
-    /**
-     * 搜索抖音关键词，点进第 index 个视频，滚动加载并提取评论。
-     *
-     * @param keyword 搜索关键词
-     * @param count   目标评论条数
-     * @param index   选择第几个视频（1-based，默认 1）
-     * @return 评论列表结果
-     */
     public CommentsResult searchAndFetchComments(String keyword, int count, int index) {
         int target = count > 0 ? count : 10;
         int videoIndex = Math.max(1, index);
@@ -127,929 +77,716 @@ public class DouyinService {
         Page page = context.newPage();
 
         try {
-            // ─── 1. 搜索 ───
             searchDouyin(page, keyword);
-
-            // ─── 2. 点击第 index 个视频 ───
+            if (isVerificationPage(page)) {
+                return new CommentsResult(false, "(验证码拦截)", page.url(), List.of());
+            }
             String videoUrl = clickVideoByIndex(page, videoIndex);
-
-            // ─── 3. 等待视频页加载 ───
             waitForVideoPage(page);
             String title = page.title();
             log.info("🎬 视频标题: {}", title);
-
-            // ─── 4. 滚动到评论区 ───
+            if (isVerificationPage(page)) {
+                return new CommentsResult(false, "(验证码拦截)", page.url(), List.of());
+            }
             scrollToComments(page);
-
-            // ─── 5. 等待首批评论渲染 ───
-            boolean hasComments = waitForCommentItems(page);
-            if (!hasComments) {
-                log.warn("⚠️ 未检测到评论（视频可能关闭了评论）");
+            if (!waitForCommentItems(page)) {
                 return new CommentsResult(true, title, videoUrl, List.of());
             }
-
-            // ─── 5.5 调试：检查 DOM 结构 ───
             debugCommentsDOM(page);
 
-            // ─── 6. 循环滚动 + 提取 ───
             List<CommentItem> collected = new ArrayList<>();
-            Set<String> seen = new HashSet<>();       // "author|||text" 去重
+            Set<String> seen = new HashSet<>();
             int staleRounds = 0;
-            int maxRounds = 20;
+            int totalRounds = 0;
 
-            for (int round = 0; round < maxRounds && collected.size() < target; round++) {
+            // 评论区滚动容器的候选选择器
+            String[] scrollContainerSels = {
+                    "[data-e2e=\"comment-list\"]",
+                    "div[class*=\"comment-list\"]",
+                    "div[class*=\"commentList\"]",
+                    "#douyin-right-container",
+            };
+
+            // 评论条目的选择器（与 extractVisibleComments 保持一致）
+            String[] itemSels = {
+                    "[data-e2e=\"comment-item\"]",
+                    "div[class*=\"comment-item\"]",
+                    "div[class*=\"commentItem\"]",
+            };
+
+            while (totalRounds < 30 && collected.size() < target) {
+                totalRounds++;
+
+                // 1) 先提取当前可见评论
+                int beforeCount = countCommentItems(page, itemSels);
                 List<CommentItem> batch = extractVisibleComments(page);
                 int before = collected.size();
-
                 for (CommentItem item : batch) {
-                    String key = item.author() + "|||" + item.text();
-                    if (seen.add(key)) {
+                    if (seen.add(item.author() + "|||" + item.text())) {
                         collected.add(item);
                         if (collected.size() >= target) break;
                     }
                 }
-
                 int added = collected.size() - before;
-                log.info("   第 {} 轮: 提取 {} 条, 新增 {} 条, 已收集 {}/{}",
-                        round + 1, batch.size(), added, collected.size(), target);
-
+                log.info("   第 {} 轮: 提取 {} 条, 新增 {} 条, 已收集 {}/{} (当前DOM共 {} 条)",
+                        totalRounds, batch.size(), added, collected.size(), target, beforeCount);
                 if (collected.size() >= target) break;
 
                 if (added == 0) {
-                    staleRounds++;
-                    if (staleRounds >= 3) {
-                        log.info("   连续 {} 轮无新评论，停止加载", staleRounds);
-                        break;
-                    }
-                } else {
-                    staleRounds = 0;
+                    if (++staleRounds >= 4) { log.info("   连续 {} 轮无新评论，停止", staleRounds); break; }
+                } else { staleRounds = 0; }
+
+                // 2) 尝试点击"点击加载更多"按钮
+                boolean clickedLoadMore = clickLoadMoreIfPresent(page);
+                if (clickedLoadMore) {
+                    // 等新评论渲染
+                    waitForNewItems(page, itemSels, beforeCount);
+                    continue;
                 }
 
-                // 向下滚动触发懒加载下一批
-                page.evaluate("() => window.scrollBy(0, 800)");
-                page.waitForTimeout(1500);
+                // 3) 滚动评论区容器以触发懒加载
+                boolean scrolled = scrollCommentContainer(page, scrollContainerSels);
+                if (scrolled) {
+                    waitForNewItems(page, itemSels, beforeCount);
+                } else {
+                    // 容器滚动失败，回退到 window 滚动
+                    page.evaluate("() => window.scrollBy(0, 1000)");
+                    page.waitForTimeout(1500);
+                }
             }
 
-            log.info("✅ 评论提取完成: {} 条 (目标 {} 条)", collected.size(), target);
-
-            // ─── 逐条输出评论到控制台 ───
-            System.out.println("=".repeat(60));
-            System.out.printf("📺 视频: %s%n", title);
-            System.out.printf("🔗 链接: %s%n", videoUrl);
-            System.out.printf("💬 评论总数: %d / 目标 %d%n", collected.size(), target);
-            System.out.println("-".repeat(60));
-            for (int i = 0; i < collected.size(); i++) {
-                CommentItem c = collected.get(i);
-                System.out.printf("[%d] 👤 %s%n", i + 1, c.author());
-                System.out.printf("    🕒 %s%n", c.time());
-                System.out.printf("    💬 %s%n", c.text());
-                System.out.println();
-            }
-            System.out.println("=".repeat(60));
-
+            log.info("✅ 评论提取完成: {} 条", collected.size());
+            printComments(title, videoUrl, collected, target);
             return new CommentsResult(true, title, videoUrl, collected);
-
         } catch (Exception e) {
             log.error("❌ 获取评论失败: {}", e.getMessage(), e);
             return new CommentsResult(false, "(操作失败)", "", List.of());
-
         } finally {
             log.info("📌 标签页保持打开，可手动查看");
         }
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // 导航 & 搜索
-    // ═══════════════════════════════════════════════════════════
+    private static void printComments(String title, String videoUrl, List<CommentItem> comments, int target) {
+        System.out.println("=".repeat(60));
+        System.out.printf("📺 视频: %s%n", title);
+        System.out.printf("🔗 链接: %s%n", videoUrl);
+        System.out.printf("💬 评论总数: %d / 目标 %d%n", comments.size(), target);
+        System.out.println("-".repeat(60));
+        int i = 0;
+        for (var c : comments) {
+            System.out.printf("[%d] 👤 %s%n", ++i, c.author());
+            System.out.printf("    🕒 %s%n", c.time());
+            System.out.printf("    💬 %s%n", c.text());
+            System.out.println();
+        }
+        System.out.println("=".repeat(60));
+    }
 
-    /**
-     * 导航到抖音搜索结果页。
-     */
+    // ════ 搜索 & 选择视频 ════
+
     private void searchDouyin(Page page, String keyword) {
-        String encoded = URLEncoder.encode(keyword, StandardCharsets.UTF_8);
-        String url = "https://www.douyin.com/search/" + encoded + "?type=video";
+        String url = "https://www.douyin.com/search/" +
+                URLEncoder.encode(keyword, StandardCharsets.UTF_8) + "?type=video";
         log.info("🔍 抖音搜索: {}", keyword);
         page.navigate(url);
 
-        // 等待搜索结果加载 —— 多策略
-        try {
-            // 策略 1: data-e2e 属性
-            page.waitForSelector("[data-e2e=\"search-result-item\"]",
-                    new Page.WaitForSelectorOptions().setTimeout(8000));
-            log.info("   ✅ 搜索结果已加载 (data-e2e) — {}", page.title());
-            return;
-        } catch (Exception ignored) {}
-
-        try {
-            // 策略 2: 视频链接（任何包含 /video/ 的 a 标签）
-            page.waitForSelector("a[href*=\"/video/\"]",
-                    new Page.WaitForSelectorOptions().setTimeout(8000));
-            log.info("   ✅ 搜索结果已加载 (video link) — {}", page.title());
-            return;
-        } catch (Exception ignored) {}
-
-        // 策略 3: 兜底等待
-        log.info("   ⏳ 选择器未命中，使用兜底等待...");
-        page.waitForTimeout(5000);
-        log.info("   ✅ 搜索结果页面: {}", page.title());
+        String[] waitSelectors = {
+                "[data-e2e=\"search-result-item\"]",
+                "a[href*=\"/video/\"]",
+                "div[class*=\"search\"] a[href*=\"/video/\"]",
+                "div[class*=\"result\"]",
+        };
+        boolean loaded = false;
+        for (String sel : waitSelectors) {
+            try {
+                page.waitForSelector(sel, new Page.WaitForSelectorOptions().setTimeout(6000));
+                log.info("   ✅ 搜索结果已加载 ({}) — {}", sel, page.title());
+                loaded = true;
+                break;
+            } catch (Exception ignored) {}
+        }
+        if (!loaded) {
+            log.info("   ⏳ 兜底等待...");
+            page.waitForTimeout(6000);
+        }
+        log.info("   📄 title='{}'", page.title());
     }
 
     /**
-     * 点击搜索结果中第 index 个视频（1-based），进入播放页。
-     *
-     * @return 视频 URL
+     * 纯 Playwright locator：找到第 index 个有效 /video/ 链接 → 直接 navigate。
      */
     private String clickVideoByIndex(Page page, int index) {
         log.info("🎬 定位第 {} 个视频...", index);
-
-        // ─── 调试：输出搜索结果 DOM ───
         debugSearchDOM(page);
 
-        // 通过 JS 查找所有视频链接，取第 index 个
-        String videoUrl;
+        var allLinks = page.locator("a[href*=\"/video/\"]");
+        int total = allLinks.count();
+
+        // 收集有效链接索引（排除 /user/、/music/，必须匹配 /video/数字）
+        var validIndices = new ArrayList<Integer>();
+        var seenVid = new HashSet<String>();
+        for (int i = 0; i < total; i++) {
+            String href = allLinks.nth(i).getAttribute("href");
+            if (href == null || href.contains("/user/") || href.contains("/music/")) continue;
+            String vid = extractVideoId(href);
+            if (vid.isEmpty() || !seenVid.add(vid)) continue;
+            validIndices.add(i);
+        }
+
+        if (validIndices.isEmpty()) {
+            throw new RuntimeException("搜索结果中未找到有效视频链接（扫描了 " + total + " 个）");
+        }
+
+        int idx = Math.min(index - 1, validIndices.size() - 1);
+        int locIdx = validIndices.get(idx);
+        String href = allLinks.nth(locIdx).getAttribute("href");
+
+        String text = "";
         try {
-            Object result = page.evaluate(
-                    "(idx) => {" +
-                    "  const links = [];" +
-                    "  const seen = new Set();" +
-                    // 策略 1: 找所有 /video/ 链接（在搜索结果区域内）
-                    "  const allLinks = document.querySelectorAll('a[href*=\"/video/\"]');" +
-                    "  for (const a of allLinks) {" +
-                    "    const href = a.getAttribute('href');" +
-                    "    if (href && !href.includes('/user/') && !seen.has(href)) {" +
-                    "      // 排除用户主页链接，只保留视频链接" +
-                    "      const match = href.match(/\\/video\\/(\\d+)/);" +
-                    "      if (match) {" +
-                    "        seen.add(href);" +
-                    "        links.push({ href: href, text: (a.textContent || '').trim().substring(0, 80) });" +
-                    "      }" +
-                    "    }" +
-                    "  }" +
-                    // 策略 2: 如果没找到足够的，找 data-e2e 卡片内的链接
-                    "  if (links.length < idx) {" +
-                    "    const cards = document.querySelectorAll('[data-e2e=\"search-result-item\"], [data-e2e*=\"video\"], div[class*=\"search\"] a[href*=\"/video/\"]');" +
-                    "    for (const el of cards) {" +
-                    "      const a = el.tagName === 'A' ? el : el.querySelector('a[href*=\"/video/\"]');" +
-                    "      if (a) {" +
-                    "        const href = a.getAttribute('href');" +
-                    "        if (href && !seen.has(href)) {" +
-                    "          const match = href.match(/\\/video\\/(\\d+)/);" +
-                    "          if (match) {" +
-                    "            seen.add(href);" +
-                    "            links.push({ href: href, text: (a.textContent || '').trim().substring(0, 80) });" +
-                    "          }" +
-                    "        }" +
-                    "      }" +
-                    "    }" +
-                    "  }" +
-                    "  if (links.length === 0) return JSON.stringify({ error: 'no-links' });" +
-                    "  const targetIdx = Math.min(idx - 1, links.length - 1);" +
-                    "  const target = links[targetIdx];" +
-                    "  return JSON.stringify({ href: target.href, text: target.text, total: links.length });" +
-                    "}",
-                    index);
+            text = allLinks.nth(locIdx).textContent();
+            if (text != null) { text = text.trim(); if (text.length() > 80) text = text.substring(0, 80); }
+        } catch (Exception ignored) {}
 
-            String json = (String) result;
-            if (json.contains("\"error\":\"no-links\"")) {
-                throw new RuntimeException("搜索结果中未找到视频链接，请检查抖音页面结构");
-            }
-
-            // 简单解析 JSON（避免引入 Jackson 依赖）
-            String href = extractJsonValue(json, "href");
-            String text = extractJsonValue(json, "text");
-            int total = Integer.parseInt(extractJsonValue(json, "total"));
-
-            log.info("   找到 {} 个视频，选中第 {} 个: {} — {}", total, index, text, href);
-
-            videoUrl = href;
-            if (videoUrl != null && !videoUrl.startsWith("http")) {
-                videoUrl = "https://www.douyin.com" + videoUrl;
-            }
-
-            // 通过 JS 点击第 index 个视频链接，并处理可能的新标签页
-            String finalUrl = videoUrl;
-            Object clickResult = page.evaluate(
-                    "(idx) => {" +
-                    "  const links = [];" +
-                    "  const seen = new Set();" +
-                    "  const allLinks = document.querySelectorAll('a[href*=\"/video/\"]');" +
-                    "  for (const a of allLinks) {" +
-                    "    const href = a.getAttribute('href');" +
-                    "    if (href && !href.includes('/user/') && !seen.has(href)) {" +
-                    "      if (href.match(/\\/video\\/(\\d+)/)) {" +
-                    "        seen.add(href);" +
-                    "        links.push(a);" +
-                    "      }" +
-                    "    }" +
-                    "  }" +
-                    "  const targetIdx = Math.min(idx - 1, links.length - 1);" +
-                    "  const target = links[targetIdx];" +
-                    "  if (target) {" +
-                    "    target.click();" +
-                    "    return 'clicked:' + target.getAttribute('href');" +
-                    "  }" +
-                    "  return 'not-found';" +
-                    "}",
-                    index);
-            log.info("   点击结果: {}", clickResult);
-
-            if (String.valueOf(clickResult).contains("not-found")) {
-                throw new RuntimeException("无法点击第 " + index + " 个视频");
-            }
-
-            // 等待页面响应
-            page.waitForTimeout(2000);
-
-            return finalUrl;
-
-        } catch (Exception e) {
-            log.warn("   JS 点击失败: {}，尝试 Playwright 原生点击", e.getMessage());
-            // 回退：使用 Playwright locator 点击
-            var allVideoLinks = page.locator("a[href*=\"/video/\"]");
-            int count = allVideoLinks.count();
-            if (count == 0) {
-                throw new RuntimeException("搜索结果中未找到视频链接");
-            }
-            int targetIdx = Math.min(index - 1, count - 1);
-            var targetLink = allVideoLinks.nth(targetIdx);
-            videoUrl = targetLink.getAttribute("href");
-            if (videoUrl != null && !videoUrl.startsWith("http")) {
-                videoUrl = "https://www.douyin.com" + videoUrl;
-            }
-            targetLink.click();
-            log.info("   ✅ Playwright 点击第 {} 个视频: {}", targetIdx + 1, videoUrl);
-            page.waitForTimeout(2000);
-            return videoUrl;
-        }
+        String videoUrl = normalizeUrl(href);
+        log.info("   选中第 {} 个 (共 {} 个有效): {} → {}", index, validIndices.size(), text, videoUrl);
+        page.navigate(videoUrl);
+        return videoUrl;
     }
 
-    /**
-     * 从简易 JSON 字符串中提取指定 key 的字符串值（不依赖 Jackson）。
-     */
-    private String extractJsonValue(String json, String key) {
-        String search = "\"" + key + "\":\"";
-        int start = json.indexOf(search);
-        if (start == -1) {
-            search = "\"" + key + "\":";
-            start = json.indexOf(search);
-            if (start == -1) return "";
-            start += search.length();
-            int end = json.indexOf(",", start);
-            if (end == -1) end = json.indexOf("}", start);
-            return json.substring(start, end).trim();
-        }
-        start += search.length();
-        int end = json.indexOf("\"", start);
-        if (end == -1) return "";
-        return json.substring(start, end)
-                .replace("\\\"", "\"")
-                .replace("\\\\", "\\");
+    private static String extractVideoId(String url) {
+        if (url == null) return "";
+        var m = java.util.regex.Pattern.compile("/video/(\\d+)").matcher(url);
+        return m.find() ? m.group(1) : "";
     }
 
-    /**
-     * 等待视频播放页加载完成。
-     */
+    private String normalizeUrl(String url) {
+        if (url == null) return null;
+        if (url.startsWith("https://") || url.startsWith("http://")) return url;
+        if (url.startsWith("//")) return "https:" + url;
+        if (url.startsWith("/")) return "https://www.douyin.com" + url;
+        return "https://www.douyin.com/" + url;
+    }
+
     private void waitForVideoPage(Page page) {
         try {
-            // 策略 1: 等待 URL 变为 /video/ 格式
-            page.waitForURL("**/video/**",
-                    new Page.WaitForURLOptions().setTimeout(15000));
+            page.waitForURL("**/video/**", new Page.WaitForURLOptions().setTimeout(15000));
             log.info("   ✅ 进入视频页: {}", page.url());
         } catch (Exception e) {
-            log.warn("   ⚠️ URL 未按预期变化，当前: {}", page.url());
+            log.warn("   ⚠️ URL 未变化: {}", page.url());
         }
-        // 额外等待渲染
+        try {
+            page.waitForSelector("video, [data-e2e=\"video-player\"], div[class*=\"player\"], #douyin-right-container",
+                    new Page.WaitForSelectorOptions().setTimeout(8000));
+            log.info("   ✅ 视频播放器已渲染");
+        } catch (Exception ignored) {}
         page.waitForTimeout(3000);
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // 登录检测
-    // ═══════════════════════════════════════════════════════════
+    // ════ 验证码 / 登录 ════
 
-    /**
-     * 检查是否已登录抖音。
-     * 通过检测页面上是否存在登录按钮或用户头像来判断。
-     */
-    private boolean isLoggedIn(Page page) {
-        try {
-            Object result = page.evaluate("() => {" +
-                    // 已登录：右上角有头像/用户菜单
-                    "const avatar = document.querySelector('[data-e2e=\"user-avatar\"], " +
-                    "  img[class*=\"avatar\"], div[class*=\"avatar\"], " +
-                    "  [data-e2e=\"profile-icon\"], [data-e2e*=\"header-avatar\"]');" +
-                    "if (avatar) return true;" +
-                    // 未登录：页面有 "登录" 按钮
-                    "const allSpans = document.querySelectorAll('span');" +
-                    "for (const s of allSpans) {" +
-                    "  if (s.textContent.trim() === '登录') return false;" +
-                    "}" +
-                    "const allButtons = document.querySelectorAll('button');" +
-                    "for (const b of allButtons) {" +
-                    "  if (b.textContent.includes('登录')) return false;" +
-                    "}" +
-                    // 检查登录弹窗/模态框
-                    "const loginModal = document.querySelector('[class*=\"login\"], [class*=\"Login\"]');" +
-                    "if (loginModal && loginModal.offsetParent !== null) return false;" +
-                    // 不确定，保守返回 false
-                    "return false;" +
-                    "}");
-            boolean loggedIn = Boolean.TRUE.equals(result);
-            if (loggedIn) {
-                log.info("✅ 已登录抖音");
-            }
-            return loggedIn;
-        } catch (Exception e) {
-            return false;
+    private boolean isVerificationPage(Page page) {
+        // 纯 Playwright：检查是否存在可见的验证码元素
+        String[] captchaSelectors = {
+                ".secsdk-captcha-drag-wrapper",
+                ".captcha_verify_container",
+                "#captcha-verify-image",
+                ".captcha_verify_img--wrapper",
+        };
+        for (String sel : captchaSelectors) {
+            try {
+                if (page.locator(sel).first().isVisible()) {
+                    log.warn("   🛡️ 检测到验证码 ({})！", sel);
+                    return true;
+                }
+            } catch (Exception ignored) {}
         }
+
+        // 登录弹窗拦截
+        try {
+            var modal = page.locator("[class*=\"login-mask\"]").first();
+            if (modal.count() > 0 && modal.isVisible()) return true;
+        } catch (Exception ignored) {}
+
+        // 检查 URL 是否被重定向到验证域名
+        String url = page.url().toLowerCase();
+        return url.contains("verify") || url.contains("captcha");
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // 评论区定位
-    // ═══════════════════════════════════════════════════════════
+    private boolean isLoggedIn(Page page) {
+        // 纯 Playwright locator: 检查是否有用户头像（已登录标志）
+        String[] loggedInSelectors = {
+                "[data-e2e=\"user-avatar\"]",
+                "img[class*=\"avatar\"]",
+                "[data-e2e=\"profile-icon\"]",
+        };
+        for (String sel : loggedInSelectors) {
+            try {
+                if (page.locator(sel).first().isVisible()) {
+                    log.info("✅ 已登录抖音");
+                    return true;
+                }
+            } catch (Exception ignored) {}
+        }
 
-    /**
-     * 滚动页面触发评论区懒加载。
-     * 抖音评论区通常在视频下方或右侧，需要滚动到可见区域才会渲染。
-     */
+        // 检查是否有显式登录按钮
+        try {
+            var loginBtn = page.locator("span:text-is(\"登录\"), button:has-text(\"登录\")").first();
+            if (loginBtn.count() > 0 && loginBtn.isVisible()) return false;
+        } catch (Exception ignored) {}
+
+        // 在视频页上保守返回 true
+        return page.url().contains("/video/");
+    }
+
+    // ════ 评论区 ════
+
     private void scrollToComments(Page page) {
-        log.info("📜 滚动页面触发评论区懒加载...");
+        log.info("📜 滚动到评论区...");
+        String[] areaSelectors = {
+                "[data-e2e=\"comment-list\"]",
+                "[data-e2e=\"comment-container\"]",
+                "div[class*=\"comment-list\"]",
+                "div[class*=\"commentList\"]",
+                "div[class*=\"comment-container\"]",
+                "#douyin-right-container",
+        };
 
         for (int i = 0; i < 15; i++) {
-            // 先检查评论区是否已经可见
-            boolean visible = (boolean) page.evaluate(
-                    "() => {" +
-                    // 多策略检测评论区可见性
-                    "  const selectors = [" +
-                    "    '[data-e2e=\"comment-list\"]'," +
-                    "    '[data-e2e=\"comment-container\"]'," +
-                    "    'div[class*=\"comment-list\"]'," +
-                    "    'div[class*=\"commentList\"]'," +
-                    "    'div[class*=\"comment-container\"]'," +
-                    "    '#douyin-right-container'" +
-                    "  ];" +
-                    "  for (const sel of selectors) {" +
-                    "    const el = document.querySelector(sel);" +
-                    "    if (!el || el.offsetParent === null) continue;" +
-                    "    const rect = el.getBoundingClientRect();" +
-                    "    if (rect.bottom > 0 && rect.top < window.innerHeight) {" +
-                    "      return true;" +
-                    "    }" +
-                    "  }" +
-                    "  return false;" +
-                    "}");
-            if (visible) {
-                log.info("   ✅ 评论区已可见 (第 {} 次检查)", i + 1);
-                // 把评论区滚动到视口中间
-                page.evaluate("() => {" +
-                        "  const selectors = [" +
-                        "    '[data-e2e=\"comment-list\"]'," +
-                        "    '[data-e2e=\"comment-container\"]'," +
-                        "    'div[class*=\"comment-list\"]'," +
-                        "    'div[class*=\"commentList\"]'," +
-                        "    'div[class*=\"comment-container\"]'," +
-                        "    '#douyin-right-container'" +
-                        "  ];" +
-                        "  for (const sel of selectors) {" +
-                        "    const el = document.querySelector(sel);" +
-                        "    if (el && el.offsetParent !== null) {" +
-                        "      el.scrollIntoView({ behavior: 'instant', block: 'center' });" +
-                        "      return;" +
-                        "    }" +
-                        "  }" +
-                        "}");
-                page.waitForTimeout(1000);
-                return;
+            // Playwright locator 检查评论区是否可见
+            for (String sel : areaSelectors) {
+                var el = page.locator(sel).first();
+                if (el.count() > 0 && el.isVisible()) {
+                    try {
+                        el.evaluate("node => node.scrollIntoView({behavior:'instant',block:'center'})");
+                    } catch (Exception ignored) {}
+                    log.info("   ✅ 评论区已可见 (第 {} 次, {})", i + 1, sel);
+                    page.waitForTimeout(1000);
+                    return;
+                }
             }
-
-            // 还没出现，往下滚 500px 触发懒加载
-            log.info("   第 {} 次滚动 (评论区尚未可见)", i + 1);
+            log.info("   第 {} 次滚动...", i + 1);
             page.evaluate("() => window.scrollBy(0, 500)");
             page.waitForTimeout(800);
         }
-
-        log.warn("   ⚠️ 滚动 15 次后评论区仍未可见");
+        log.warn("   ⚠️ 评论区未出现");
     }
 
-    /**
-     * 等待评论条目渲染。
-     *
-     * @return true 如果检测到评论，false 如果没有
-     */
     private boolean waitForCommentItems(Page page) {
-        String[] commentSelectors = {
+        String[] selectors = {
                 "[data-e2e=\"comment-item\"]",
                 "div[class*=\"comment-item\"]",
                 "div[class*=\"commentItem\"]",
-                // 任何评论区容器内的列表项
-                "[data-e2e=\"comment-list\"] > div",
-                "div[class*=\"comment-list\"] > div",
-                "div[class*=\"commentList\"] > div",
         };
-        for (String sel : commentSelectors) {
+        for (String sel : selectors) {
             try {
-                page.waitForSelector(sel,
-                        new Page.WaitForSelectorOptions().setTimeout(8000));
-                log.info("   ✅ 评论条目已渲染 (选择器: {})", sel);
+                page.waitForSelector(sel, new Page.WaitForSelectorOptions().setTimeout(8000));
+                log.info("   ✅ 评论条目已渲染 ({})", sel);
                 return true;
             } catch (Exception ignored) {}
         }
         return false;
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // 评论提取
-    // ═══════════════════════════════════════════════════════════
+    // ════ 评论提取 ════
 
-    /**
-     * 从当前已渲染的评论 DOM 中提取所有评论数据。
-     * <p>
-     * 抖音前端使用 React + CSS Modules，类名为动态哈希值。
-     * 采用多策略 JS 注入：优先 data-e2e 属性，其次类名部分匹配，最后文本解析兜底。
-     */
+    /** JS 只做 DOM 导航，字符串清洗全部在 Java 侧。 */
     @SuppressWarnings("unchecked")
     private List<CommentItem> extractVisibleComments(Page page) {
         try {
-            List<List<String>> raw = (List<List<String>>) page.evaluate("() => {" +
-                    "const results = [];" +
-                    // ═══════════════════════════════════════════
-                    // 策略 1: data-e2e 属性选择器
-                    // ═══════════════════════════════════════════
-                    "let items = document.querySelectorAll('[data-e2e=\"comment-item\"]');" +
-                    "if (items.length === 0) {" +
-                    // ═══════════════════════════════════════════
-                    // 策略 2: 类名部分匹配（CSS Modules 哈希前缀）
-                    // ═══════════════════════════════════════════
-                    "  items = document.querySelectorAll('div[class*=\"comment-item\"], div[class*=\"commentItem\"]');" +
-                    "}" +
-                    "if (items.length === 0) {" +
-                    // ═══════════════════════════════════════════
-                    // 策略 3: 在评论区容器内递归查找疑似评论节点
-                    // ═══════════════════════════════════════════
-                    "  const containers = document.querySelectorAll(" +
-                    "    '[data-e2e=\"comment-list\"], " +
-                    "    'div[class*=\"comment-list\"], div[class*=\"commentList\"], " +
-                    "    'div[class*=\"comment-container\"], " +
-                    "    '#douyin-right-container'" +
-                    "  );" +
-                    "  for (const container of containers) {" +
-                    "    // 找所有包含文本且看起来像评论的叶子 div" +
-                    "    const divs = container.querySelectorAll('div');" +
-                    "    const candidates = [];" +
-                    "    for (const div of divs) {" +
-                    "      if (div.children.length >= 2 && div.children.length <= 6) {" +
-                    "        const text = div.textContent.trim();" +
-                    "        // 评论通常至少 3 个字，且包含时间关键词或用户名字样的短行" +
-                    "        if (text.length > 5 && text.length < 2000) {" +
-                    "          const hasName = div.querySelector('span, a, [class*=\"name\"], [class*=\"nick\"]');" +
-                    "          const hasTime = /\\d+\\s*(分钟|小时|天|秒|刚刚|前)/.test(text);" +
-                    "          if (hasName || hasTime) candidates.push(div);" +
-                    "        }" +
-                    "      }" +
-                    "    }" +
-                    "    if (candidates.length > 0) {" +
-                    "      items = candidates;" +
-                    "      break;" +
-                    "    }" +
-                    "  }" +
-                    "}" +
-                    "" +
-                    "for (const item of items) {" +
-                    "  try {" +
-                    "    let author = '';" +
-                    "    let text = '';" +
-                    "    let time = '';" +
-                    "    " +
-                    // ── 提取作者 ──
-                    "    const authorEl = item.querySelector(" +
-                    "      '[data-e2e=\"comment-username\"], " +
-                    "      'span[class*=\"username\"], span[class*=\"nickname\"], span[class*=\"name\"], " +
-                    "      'a[class*=\"name\"], a[class*=\"nick\"]'" +
-                    "    );" +
-                    "    if (authorEl) author = authorEl.textContent.trim();" +
-                    "" +
-                    // ── 提取评论正文 ──
-                    "    const textEl = item.querySelector(" +
-                    "      '[data-e2e=\"comment-content\"], " +
-                    "      'span[class*=\"text\"], span[class*=\"content\"], div[class*=\"content\"], " +
-                    "      'p[class*=\"text\"], span[class*=\"desc\"]'" +
-                    "    );" +
-                    "    if (textEl) {" +
-                    "      text = textEl.textContent.trim();" +
-                    "    } else {" +
-                    // 文本兜底：整个 item 的文本去掉作者和时间
-                    "      const allText = item.textContent.trim();" +
-                    "      if (author && allText.startsWith(author)) {" +
-                    "        text = allText.substring(author.length).trim();" +
-                    "      } else {" +
-                    "        text = allText;" +
-                    "      }" +
-                    "    }" +
-                    "" +
-                    // ── 提取时间 ──
-                    "    const timeEl = item.querySelector(" +
-                    "      'span[class*=\"time\"], span[class*=\"date\"], span[class*=\"Time\"]'" +
-                    "    );" +
-                    "    if (timeEl) {" +
-                    "      time = timeEl.textContent.trim();" +
-                    "    } else {" +
-                    // 时间兜底：从文本中匹配 "x分钟前", "x小时前", "x天前" 等
-                    "      const allText = item.textContent;" +
-                    "      const match = allText.match(/\\d+\\s*(分钟前|小时前|天前|秒前|周前|月前|刚刚)/);" +
-                    "      if (match) time = match[0];" +
-                    "    }" +
-                    "" +
-                    // ── 清理文本（去掉时间后缀） ──
-                    "    if (time && text.endsWith(time)) {" +
-                    "      text = text.substring(0, text.length - time.length).trim();" +
-                    "    }" +
-                    // 去掉回复前缀
-                    "    text = text.replace(/^回复\\s*@?\\S+:?\\s*/, '').trim();" +
-                    "" +
-                    "    if (text.length > 1) {" +
-                    "      results.push([author, text, time]);" +
-                    "    }" +
-                    "  } catch(e) {}" +
-                    "}" +
-                    "return results;" +
-                    "}");
+            var items = page.locator("[data-e2e=\"comment-item\"]");
+            if (items.count() == 0) {
+                items = page.locator("div[class*=\"comment-item\"], div[class*=\"commentItem\"]");
+            }
+            if (items.count() == 0) return List.of();
+
+            // JS: 只做 DOM 查询，返回原始字段 [authorFromLink, fullTextContent, timeFromRegex, bodyText]
+            List<List<String>> raw = (List<List<String>>) page.evaluate(
+                "() => {" +
+                "  var all = document.querySelectorAll('[data-e2e=\"comment-item\"], " +
+                "    div[class*=\"comment-item\"], div[class*=\"commentItem\"]');" +
+                "  return Array.from(all).map(function(item) {" +
+                // 跳过嵌套子回复
+                "    var p = item.parentElement;" +
+                "    while (p && p !== document.body) {" +
+                "      if (p.getAttribute && p.getAttribute('data-e2e') === 'comment-item') return null;" +
+                "      p = p.parentElement;" +
+                "    }" +
+                "    var full = (item.textContent || '').trim();" +
+                // 作者链接
+                "    var author = '';" +
+                "    var ua = item.querySelector('a[href*=\"/user/\"]');" +
+                "    if (ua) author = (ua.textContent || '').trim();" +
+                // 时间
+                "    var tm = '';" +
+                "    var m = full.match(/\\d+\\s*(分钟前|小时前|天前|秒前|周前|月前|年前)|刚刚|\\d+-\\d+-\\d+/);" +
+                "    if (m) tm = m[0];" +
+                // 正文容器文本
+                "    var body = '';" +
+                "    var be = item.querySelector('[data-e2e=\"comment-content\"], " +
+                "      [class*=\"comment-content\"], [class*=\"FduGc\"]');" +
+                "    if (be) body = (be.textContent || '').trim();" +
+                "    return [author, full, tm, body];" +
+                "  }).filter(function(r) { return r !== null; });" +
+                "}");
 
             if (raw == null) return List.of();
 
-            List<CommentItem> items = new ArrayList<>();
-            for (List<String> row : raw) {
-                if (row.size() >= 3) {
-                    items.add(new CommentItem(
-                            row.get(0) != null ? row.get(0) : "",
-                            row.get(1) != null ? row.get(1) : "",
-                            row.get(2) != null ? row.get(2) : ""));
-                }
-            }
-            return items;
+            // Java 侧：字符串清洗 + 过滤
+            var noisePattern = java.util.regex.Pattern.compile(
+                    "^\\d+\\s*(分享回复|条回复)$|^展开\\d+条回复$");
+            var replyPattern = java.util.regex.Pattern.compile(
+                    "^回复\\s*@?\\S*:?\\s*");
+            var atPattern = java.util.regex.Pattern.compile(
+                    "^@\\S+\\s*");
+            var nameTextPattern = java.util.regex.Pattern.compile(
+                    "^(\\S+?)\\.\\.\\.(.+)");  // "Name...actualText"
 
+            List<CommentItem> result = new ArrayList<>();
+            for (List<String> row : raw) {
+                if (row.size() < 4) continue;
+                String author = nz(row.get(0));
+                String fullText = nz(row.get(1));
+                String time = nz(row.get(2));
+                String bodyText = nz(row.get(3));
+
+                // 过滤 "X分享回复" / "展开X条回复"
+                if (noisePattern.matcher(fullText).matches()) continue;
+
+                // 选正文：bodyText 优先，否则从 fullText 剥离作者+时间+尾部噪音
+                String text;
+                if (!bodyText.isEmpty()) {
+                    text = bodyText;
+                    // body 也可能以作者名开头，剥离
+                    if (!author.isEmpty() && text.startsWith(author)) {
+                        text = text.substring(author.length()).trim();
+                    }
+                } else {
+                    text = fullText;
+                    if (!author.isEmpty() && text.startsWith(author)) {
+                        text = text.substring(author.length()).trim();
+                    }
+                    // 从时间位置截断（去掉时间、地点、回复数等元数据）
+                    if (!time.isEmpty()) {
+                        int ti = text.indexOf(time);
+                        if (ti > 0) text = text.substring(0, ti).trim();
+                    }
+                }
+
+                // 清理 "回复 @xxx:" / "@xxx "
+                text = replyPattern.matcher(text).replaceFirst("").trim();
+                text = atPattern.matcher(text).replaceFirst("").trim();
+
+                // 作者名兜底：尝试 "Name...text" 格式（作者可能只在 fullText 里）
+                if (author.isEmpty()) {
+                    var nm = nameTextPattern.matcher(text);
+                    if (nm.find()) {
+                        author = nm.group(1);
+                        text = nm.group(2).trim();
+                    } else {
+                        // bodyText 里没有作者，从 fullText 提取作者名
+                        nm = nameTextPattern.matcher(fullText);
+                        if (nm.find()) author = nm.group(1);
+                    }
+                }
+
+                // 最终验证
+                if (noisePattern.matcher(text).matches()) continue;
+                if (text.isEmpty() && author.isEmpty()) continue;
+
+                result.add(new CommentItem(author, text, time));
+            }
+            return result;
         } catch (Exception e) {
             log.warn("   ⚠️ 评论提取失败: {}", e.getMessage());
             return List.of();
         }
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // 发表评论
-    // ═══════════════════════════════════════════════════════════
+    private static String nz(String s) { return s != null ? s : ""; }
 
-    /**
-     * 在视频下方发表评论。
-     * <p>
-     * 抖音评论区输入框通常是一个 contenteditable div 或 textarea，
-     * 交互流程：
-     * 1. 点击评论占位符展开评论框
-     * 2. 在可编辑区域填入文字（采用模拟人类打字速度）
-     * 3. 点击提交按钮
-     */
+    // ════ 异步加载更多评论 ════
+
+    /** 统计当前页面上评论条目的数量 */
+    private int countCommentItems(Page page, String[] selectors) {
+        for (String sel : selectors) {
+            try {
+                int count = page.locator(sel).count();
+                if (count > 0) return count;
+            } catch (Exception ignored) {}
+        }
+        return 0;
+    }
+
+    /** 点击"点击加载更多"按钮，先用 Playwright 定位，失败则用 JS 全局搜索。 */
+    private boolean clickLoadMoreIfPresent(Page page) {
+        String[] loadMoreTexts = {"点击加载更多", "加载更多", "展开更多评论", "查看全部评论"};
+        for (String text : loadMoreTexts) {
+            // Playwright: span/button/div 均可
+            for (String tag : new String[]{"span", "button", "div"}) {
+                try {
+                    var btn = page.locator(tag + ":has-text(\"" + text + "\")").first();
+                    if (btn.count() > 0 && btn.isVisible()) {
+                        log.info("   🔘 点击 '{}' ({} 定位)", text, tag);
+                        btn.click();
+                        page.waitForTimeout(2500);
+                        return true;
+                    }
+                } catch (Exception ignored) {}
+            }
+        }
+        // JS 兜底：遍历所有元素找匹配文本的 clickable 元素
+        try {
+            Object jsResult = page.evaluate(
+                "() => {" +
+                "  var texts = ['点击加载更多','加载更多','展开更多评论','查看全部评论'];" +
+                "  for (var i = 0; i < texts.length; i++) {" +
+                "    var all = document.querySelectorAll('span, button, div');" +
+                "    for (var j = 0; j < all.length; j++) {" +
+                "      var el = all[j];" +
+                "      if (el.children.length > 0) continue;" +          // 只取叶子节点
+                "      if ((el.textContent||'').trim() === texts[i]) {" +
+                "        el.click();" +
+                "        return JSON.stringify({text:texts[i], tag:el.tagName});" +
+                "      }" +
+                "    }" +
+                "  }" +
+                "  return null;" +
+                "}");
+            if (jsResult != null) {
+                log.info("   🔘 JS 点击: {}", jsResult);
+                page.waitForTimeout(2500);
+                return true;
+            }
+        } catch (Exception ignored) {}
+        return false;
+    }
+
+    /** 把最后一个评论条目滚到视野底部，触发懒加载。 */
+    private boolean scrollCommentContainer(Page page, String[] containerSels) {
+        // 方案A: 把最后一个 comment-item 滚到视野底部（最可靠）
+        try {
+            Object result = page.evaluate(
+                "() => {" +
+                // 找到评论可见区域内的最后一个 comment-item
+                "  var items = document.querySelectorAll('[data-e2e=\"comment-item\"]');" +
+                "  if (items.length === 0) return null;" +
+                "  var last = items[items.length - 1];" +
+                "  last.scrollIntoView({behavior:'instant', block:'end'});" +
+                "  return JSON.stringify({method:'scrollIntoView', index:items.length-1});" +
+                "}");
+            if (result != null) {
+                log.info("   📜 scrollIntoView 最后一个 comment-item: {}", result);
+                page.waitForTimeout(1500);
+                return true;
+            }
+        } catch (Exception ignored) {}
+
+        // 方案B: 在容器内 mouse wheel 滚动
+        for (String sel : containerSels) {
+            try {
+                var container = page.locator(sel).first();
+                if (container.count() > 0) {
+                    var box = container.boundingBox();
+                    if (box != null) {
+                        double cx = box.x + box.width / 2;
+                        double cy = box.y + box.height / 2;
+                        page.mouse().move(cx, cy);
+                        page.mouse().wheel(0, 1000);
+                        log.info("   📜 mouse.wheel 在容器 {} ({}, {})", sel, cx, cy);
+                        page.waitForTimeout(1500);
+                        return true;
+                    }
+                }
+            } catch (Exception ignored) {}
+        }
+
+        // 方案C: 回退到 window 滚动
+        page.evaluate("() => window.scrollBy(0, 1200)");
+        page.waitForTimeout(1500);
+        return false;
+    }
+
+    /** 等待新的评论条目出现（DOM 数量增加或超时） */
+    private void waitForNewItems(Page page, String[] itemSels, int beforeCount) {
+        for (int w = 0; w < 15; w++) {
+            page.waitForTimeout(400);
+            int now = countCommentItems(page, itemSels);
+            if (now > beforeCount) {
+                log.info("   ✅ 新评论已渲染 ({} → {})", beforeCount, now);
+                return;
+            }
+        }
+        log.info("   ⏳ 等待超时 ({} 条未变)", beforeCount);
+    }
+
+    // ════ 发表评论 ════
+
     private void postComment(Page page, String comment) {
         log.info("💬 撰写评论: {}", comment);
-
-        // ─── 0. 调试：打印评论区 DOM 结构 ───
         debugCommentsDOM(page);
-
-        // ─── 1. 展开评论输入框 ───
         expandCommentBox(page);
-
-        // ─── 2. 填入文字 ───
         fillCommentBox(page, comment);
-
-        // ─── 3. 提交评论 ───
         clickSubmitButton(page);
-
-        // 等评论提交完成
         page.waitForTimeout(3000);
     }
 
-    /**
-     * 展开评论输入框。
-     * 通过 JS 查找评论输入入口并点击，支持多策略降级。
-     */
     private void expandCommentBox(Page page) {
         log.info("   📝 展开评论输入框...");
 
+        // 策略 1: data-e2e
         try {
-            Object result = page.evaluate("() => {" +
-                    // ═══════════════════════════════════════════
-                    // 辅助函数：递归穿透 Shadow DOM（抖音可能用 Web Components）
-                    // ═══════════════════════════════════════════
-                    "function deepQuerySelector(root, predicate, maxDepth) {" +
-                    "  if (maxDepth === undefined) maxDepth = 5;" +
-                    "  if (maxDepth <= 0 || !root) return null;" +
-                    "  try {" +
-                    "    const all = root.querySelectorAll ? root.querySelectorAll('*') : [];" +
-                    "    for (const el of all) {" +
-                    "      try { if (predicate(el) && el.offsetParent !== null) return el; } catch(e) {}" +
-                    "      try {" +
-                    "        if (el.shadowRoot) {" +
-                    "          const found = deepQuerySelector(el.shadowRoot, predicate, maxDepth - 1);" +
-                    "          if (found) return found;" +
-                    "        }" +
-                    "      } catch(e) {}" +
-                    "    }" +
-                    "  } catch(e) {}" +
-                    "  return null;" +
-                    "}" +
-                    "" +
-                    // ── 策略 1: 找评论输入框占位符 ──
-                    "let el = document.querySelector('[data-e2e=\"comment-input\"], [data-e2e=\"comment-input-area\"]');" +
-                    "if (!el) el = deepQuerySelector(document, (el) => {" +
-                    "  const ph = (el.getAttribute('placeholder') || '').toLowerCase();" +
-                    "  const aria = (el.getAttribute('aria-label') || '').toLowerCase();" +
-                    "  const text = (el.textContent || '').trim();" +
-                    "  return ph.includes('评论') || ph.includes('comment') || " +
-                    "         aria.includes('评论') || aria.includes('comment') || " +
-                    "         text === '评论' || text === '说点什么...' || text === '有爱评论，说点儿好听的~';" +
-                    "});" +
-                    "if (el) { el.click(); return 'placeholder:' + (el.getAttribute('placeholder') || el.textContent); }" +
-                    "" +
-                    // ── 策略 2: 找 contenteditable div ──
-                    "el = document.querySelector('div[contenteditable=\"true\"]');" +
-                    "if (!el) el = deepQuerySelector(document, (el) => el.isContentEditable);" +
-                    "if (el) { el.click(); el.focus(); return 'contenteditable'; }" +
-                    "" +
-                    // ── 策略 3: 找 textarea ──
-                    "el = document.querySelector('textarea[placeholder*=\"评论\"], textarea[placeholder*=\"comment\" i], textarea');" +
-                    "if (el) { el.click(); el.focus(); return 'textarea:' + (el.getAttribute('placeholder') || ''); }" +
-                    "" +
-                    // ── 策略 4: 点击评论区容器内第一个可交互元素 ──
-                    "const containers = document.querySelectorAll('[data-e2e=\"comment-list\"], div[class*=\"comment\"], #douyin-right-container');" +
-                    "for (const c of containers) {" +
-                    "  const input = c.querySelector('div[contenteditable], textarea, input[type=\"text\"]');" +
-                    "  if (input) { input.click(); input.focus(); return 'container-input'; }" +
-                    "}" +
-                    "" +
-                    "return 'not-found';" +
-                    "}");
-            log.info("   JS 查找结果: {}", result);
+            var el = page.locator("[data-e2e=\"comment-input\"], [data-e2e=\"comment-input-area\"]").first();
+            if (el.count() > 0 && el.isVisible()) { el.click(); page.waitForTimeout(1000); return; }
+        } catch (Exception ignored) {}
 
-            if (!"not-found".equals(result)) {
-                log.info("   ✅ 评论框展开成功");
-                page.waitForTimeout(1000);
-                return;
-            }
-        } catch (Exception e) {
-            log.warn("   JS 展开评论框异常: {}", e.getMessage());
-        }
+        // 策略 2: contenteditable
+        try {
+            var el = page.locator("div[contenteditable=\"true\"]").first();
+            if (el.count() > 0) { el.click(); page.waitForTimeout(1000); return; }
+        } catch (Exception ignored) {}
 
-        log.warn("   ⚠️ 所有策略均未找到评论入口");
+        // 策略 3: textarea
+        try {
+            var el = page.locator("textarea").first();
+            if (el.count() > 0) { el.click(); page.waitForTimeout(1000); return; }
+        } catch (Exception ignored) {}
+
+        // 策略 4: 点评论区容器
+        try {
+            page.locator("div[class*=\"comment\"]").first()
+                    .click(new com.microsoft.playwright.Locator.ClickOptions().setTimeout(3000));
+            page.waitForTimeout(1500);
+        } catch (Exception ignored) {}
     }
 
-    /**
-     * 在评论编辑器中填入文字。
-     * 优先使用 fill（快速），失败则降级为逐字 humanType（反爬）。
-     */
     private void fillCommentBox(Page page, String comment) {
-        // 策略 1: 尝试快速 fill
         String[] selectors = {
                 "div[contenteditable=\"true\"]",
-                "textarea[placeholder*=\"评论\" i]",
                 "textarea",
                 "[data-e2e=\"comment-input\"] div[contenteditable]",
-                "[data-e2e=\"comment-input\"] textarea",
         };
         for (String sel : selectors) {
             try {
-                log.info("   尝试填入评论 (选择器: {}) ...", sel);
                 page.waitForSelector(sel,
-                        new Page.WaitForSelectorOptions()
-                                .setState(WaitForSelectorState.VISIBLE)
-                                .setTimeout(5000));
+                        new Page.WaitForSelectorOptions().setState(WaitForSelectorState.VISIBLE).setTimeout(4000));
                 page.waitForTimeout(300);
-
                 var box = page.locator(sel).first();
                 box.click();
                 page.waitForTimeout(200);
-
-                // 优先用 fill（速度快）
                 box.fill(comment);
-                log.info("   ✅ 评论内容已填入 (fill, 选择器: {})", sel);
+                log.info("   ✅ 评论已填入 ({})", sel);
                 page.waitForTimeout(500);
                 return;
-            } catch (Exception e) {
-                log.info("   选择器 {} 失败，尝试下一个...", sel);
-            }
+            } catch (Exception ignored) {}
         }
 
-        // 策略 2: JS 直接设置 + 模拟人类打字（键盘逐字输入）
-        log.info("   所有 fill 策略失败，尝试 JS + 键盘打字...");
-        try {
-            page.evaluate("(text) => {" +
-                    "  const el = document.querySelector('div[contenteditable=\"true\"], textarea, [data-e2e=\"comment-input\"]');" +
-                    "  if (!el) return 'not-found';" +
-                    "  el.click();" +
-                    "  el.focus();" +
-                    "  if (el.isContentEditable) {" +
-                    "    el.textContent = '';" +
-                    "  } else {" +
-                    "    el.value = '';" +
-                    "  }" +
-                    "  return 'found';" +
-                    "}", comment);
-
-            // 逐字键入（模拟人类打字，绕过反爬检测）
-            humanType(page, comment);
-            return;
-        } catch (Exception e) {
-            log.warn("   JS 打字也失败: {}", e.getMessage());
-        }
-
-        throw new RuntimeException("无法找到抖音评论输入框（已尝试所有策略）");
+        // 兜底: 键盘逐字输入
+        log.info("   使用键盘逐字输入...");
+        humanType(page, comment);
     }
 
-    /**
-     * 模拟人类打字：逐字输入，带随机延迟。
-     * 绕开抖音对 fill() / 一次性粘贴的反爬检测。
-     */
     private void humanType(Page page, String text) {
-        log.info("   ⌨️  逐字输入中 ({} 字)...", text.length());
         try {
-            // 先聚焦到可编辑元素
-            page.evaluate("() => {" +
-                    "  const el = document.querySelector('div[contenteditable=\"true\"], textarea');" +
-                    "  if (el) { el.click(); el.focus(); }" +
-                    "}");
+            page.locator("div[contenteditable=\"true\"]").first().click();
             page.waitForTimeout(200);
-
-            // 用 Playwright 键盘逐字输入
             for (int i = 0; i < text.length(); i++) {
-                String ch = text.substring(i, i + 1);
-                page.keyboard().type(ch);
-                // 随机延迟 50-200ms
-                long delay = 50 + (long) (Math.random() * 150);
-                page.waitForTimeout(delay);
+                page.keyboard().type(text.substring(i, i + 1));
+                page.waitForTimeout(50 + (long) (Math.random() * 150));
             }
             log.info("   ✅ 逐字输入完成");
         } catch (Exception e) {
-            log.warn("   ⚠️ 逐字输入异常: {}，尝试 fill 兜底", e.getMessage());
-            try {
-                var box = page.locator("div[contenteditable=\"true\"]").first();
-                box.fill(text);
-            } catch (Exception ignored) {}
+            throw new RuntimeException("无法输入评论", e);
         }
     }
 
-    /**
-     * 找到并点击评论提交按钮。
-     */
     private void clickSubmitButton(Page page) {
-        page.waitForTimeout(500);
+        page.waitForTimeout(1000);
 
-        try {
-            Object result = page.evaluate("() => {" +
-                    // 策略 1: data-e2e
-                    "let btn = document.querySelector('[data-e2e=\"comment-submit\"], [data-e2e=\"comment-send\"], [data-e2e=\"comment-publish\"]');" +
-                    "if (btn && btn.offsetParent !== null) {" +
-                    "  btn.click();" +
-                    "  return 'e2e:' + (btn.textContent.trim().substring(0, 20));" +
-                    "}" +
-                    // 策略 2: 按钮文本
-                    "const keywords = ['发送', '发布', '评论', 'Send', 'Publish', 'Submit'];" +
-                    "const buttons = document.querySelectorAll('button, span[role=\"button\"], div[role=\"button\"]');" +
-                    "for (const b of buttons) {" +
-                    "  if (b.offsetParent === null) continue;" +
-                    "  const text = (b.textContent || '').trim();" +
-                    "  for (const kw of keywords) {" +
-                    "    if (text === kw || text.includes(kw)) {" +
-                    "      b.click();" +
-                    "      return 'text:' + text.substring(0, 20);" +
-                    "    }" +
-                    "  }" +
-                    "}" +
-                    // 策略 3: 在评论区输入框附近找 button
-                    "const inputAreas = document.querySelectorAll('div[contenteditable=\"true\"]');" +
-                    "for (const input of inputAreas) {" +
-                    "  // 向上找，找到包含按钮的父容器" +
-                    "  let parent = input.parentElement;" +
-                    "  for (let i = 0; i < 5 && parent; i++) {" +
-                    "    const btn = parent.querySelector('button');" +
-                    "    if (btn && btn.offsetParent !== null) {" +
-                    "      btn.click();" +
-                    "      return 'nearby:' + (btn.textContent.trim().substring(0, 20));" +
-                    "    }" +
-                    "    parent = parent.parentElement;" +
-                    "  }" +
-                    "}" +
-                    "return 'not-found';" +
-                    "}");
-            log.info("   提交按钮查找结果: {}", result);
-            if (!"not-found".equals(result)) {
-                log.info("   ✅ 评论已提交");
-                return;
-            }
-        } catch (Exception e) {
-            log.warn("   JS 提交按钮异常: {}", e.getMessage());
-        }
-
-        // 回退：Playwright locator 方式
-        String[] submitSelectors = {
-                "button:has-text(\"发送\")",
-                "button:has-text(\"发布\")",
-                "button:has-text(\"评论\")",
-                "[data-e2e=\"comment-submit\"]",
-                "[data-e2e=\"comment-send\"]",
-                "[data-e2e=\"comment-publish\"]",
-                "span:has-text(\"发送\")",
-                "span:has-text(\"发布\")",
+        // 策略1: 评论区 contenteditable 里按 Enter（抖音最可靠的提交方式）
+        String[] commentBoxSels = {
+                "[data-e2e=\"comment-list\"] div[contenteditable=\"true\"]",
+                "div[class*=\"comment-mainContent\"] div[contenteditable=\"true\"]",
+                "div[class*=\"comment-container\"] div[contenteditable=\"true\"]",
         };
-        for (String sel : submitSelectors) {
+        for (String sel : commentBoxSels) {
             try {
-                var btn = page.locator(sel).first();
-                btn.waitFor(new com.microsoft.playwright.Locator.WaitForOptions().setTimeout(3000));
-                if (btn.isEnabled()) {
-                    btn.click();
-                    log.info("   ✅ 评论已提交 (选择器: {})", sel);
+                var box = page.locator(sel).first();
+                if (box.count() > 0) {
+                    box.press("Enter");
+                    log.info("   ✅ Enter 已发送 ({})", sel);
+                    page.waitForTimeout(2000);
                     return;
                 }
             } catch (Exception ignored) {}
         }
-        throw new RuntimeException("无法找到抖音提交按钮");
+
+        // 策略2: 所有 contenteditable 的最后一个（评论框通常在搜索框后面）
+        try {
+            var all = page.locator("div[contenteditable=\"true\"]");
+            if (all.count() > 0) {
+                all.last().press("Enter");
+                log.info("   ✅ Enter 已发送 (last contenteditable)");
+                page.waitForTimeout(2000);
+                return;
+            }
+        } catch (Exception ignored) {}
+
+        // 策略3: 评论区容器内找发送/发布按钮
+        String[] containers = {"[data-e2e=\"comment-list\"]", "div[class*=\"comment-mainContent\"]",
+                "div[class*=\"comment-container\"]", "#douyin-right-container"};
+        for (String container : containers) {
+            for (String t : new String[]{"发送", "发布"}) {
+                try {
+                    var btn = page.locator(container + " button:text-is(\"" + t + "\"), " +
+                            container + " span:text-is(\"" + t + "\"), " +
+                            container + " [class*=\"submit\"], " +
+                            container + " [class*=\"send\"]").first();
+                    if (btn.count() > 0 && btn.isVisible() && btn.isEnabled()) {
+                        btn.evaluate("el => el.click()");  // 原生 click，不走 Playwright 事件链
+                        log.info("   ✅ 原生点击 ({}: {})", container, t);
+                        page.waitForTimeout(2000);
+                        return;
+                    }
+                } catch (Exception ignored) {}
+            }
+        }
+
+        // 策略4: 全局 Enter
+        log.info("   ⌨️ 全局 Enter");
+        page.keyboard().press("Enter");
+        page.waitForTimeout(2000);
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // 调试方法
-    // ═══════════════════════════════════════════════════════════
+    // ════ 调试方法 ════
 
-    /**
-     * 调试：输出搜索结果页 DOM 结构，辅助排查选择器问题。
-     */
     private void debugSearchDOM(Page page) {
         try {
-            String info = (String) page.evaluate("() => {" +
-                    "const diag = {};" +
-                    "diag.url = location.href;" +
-                    "diag.title = document.title;" +
-                    // 统计视频链接
-                    "const links = document.querySelectorAll('a[href*=\"/video/\"]');" +
-                    "diag.videoLinkCount = links.length;" +
-                    "const first5 = [];" +
-                    "for (let i = 0; i < Math.min(5, links.length); i++) {" +
-                    "  first5.push({" +
-                    "    href: links[i].getAttribute('href')," +
-                    "    text: (links[i].textContent || '').trim().substring(0, 60)" +
-                    "  });" +
-                    "}" +
-                    "diag.first5Links = first5;" +
-                    // 统计 data-e2e 元素
-                    "diag.e2eSearchResult = document.querySelectorAll('[data-e2e*=\"search\"]').length;" +
-                    "diag.e2eVideo = document.querySelectorAll('[data-e2e*=\"video\"]').length;" +
-                    "diag.e2eFeed = document.querySelectorAll('[data-e2e*=\"feed\"]').length;" +
-                    "return JSON.stringify(diag);" +
-                    "}");
-            log.info("   🔍 搜索页诊断: {}", info);
+            String info = (String) page.evaluate(
+                "() => JSON.stringify({" +
+                "  url:location.href, title:document.title," +
+                "  videoLinkCount:document.querySelectorAll('a[href*=\"/video/\"]').length," +
+                "  first5:Array.from(document.querySelectorAll('a[href*=\"/video/\"]')).slice(0,5)" +
+                "    .map(a=>({href:a.getAttribute('href'),text:(a.textContent||'').trim().substring(0,60)}))," +
+                "  bodyStart:(document.body.textContent||'').trim().substring(0,300)" +
+                "})");
+            log.info("   🔍 搜索页: {}", info);
         } catch (Exception e) {
             log.info("   🔍 搜索页诊断失败: {}", e.getMessage());
         }
     }
 
-    /**
-     * 调试：输出评论区域 DOM 结构，辅助排查选择器问题。
-     */
     private void debugCommentsDOM(Page page) {
         try {
-            String info = (String) page.evaluate("() => {" +
-                    "const diag = {};" +
-                    // 查找评论区容器
-                    "const containers = [" +
-                    "  '[data-e2e=\"comment-list\"]'," +
-                    "  '[data-e2e=\"comment-container\"]'," +
-                    "  'div[class*=\"comment-list\"]'," +
-                    "  'div[class*=\"commentList\"]'," +
-                    "  'div[class*=\"comment-container\"]'," +
-                    "  '#douyin-right-container'" +
-                    "];" +
-                    "for (const sel of containers) {" +
-                    "  const el = document.querySelector(sel);" +
-                    "  if (el) {" +
-                    "    diag.containerSelector = sel;" +
-                    "    diag.containerHTML = el.outerHTML.substring(0, 1500);" +
-                    "    break;" +
-                    "  }" +
-                    "}" +
-                    "if (!diag.containerSelector) diag.containerSelector = 'not-found';" +
-                    // 统计评论条目
-                    "const items1 = document.querySelectorAll('[data-e2e=\"comment-item\"]');" +
-                    "const items2 = document.querySelectorAll('div[class*=\"comment-item\"], div[class*=\"commentItem\"]');" +
-                    "diag.e2eCommentCount = items1.length;" +
-                    "diag.classCommentCount = items2.length;" +
-                    // 查找评论输入框
-                    "const editable = document.querySelector('div[contenteditable=\"true\"]');" +
-                    "diag.hasContentEditable = !!editable;" +
-                    "const textarea = document.querySelector('textarea');" +
-                    "diag.hasTextarea = !!textarea;" +
-                    // 查找提交按钮
-                    "const buttons = document.querySelectorAll('button');" +
-                    "const btnTexts = [];" +
-                    "for (let i = 0; i < Math.min(5, buttons.length); i++) {" +
-                    "  btnTexts.push((buttons[i].textContent || '').trim().substring(0, 30));" +
-                    "}" +
-                    "diag.buttonTexts = btnTexts;" +
-                    "return JSON.stringify(diag);" +
-                    "}");
-            log.info("   🔍 评论区诊断: {}", info);
+            String info = (String) page.evaluate(
+                "() => JSON.stringify({" +
+                "  e2e:document.querySelectorAll('[data-e2e=\"comment-item\"]').length," +
+                "  class:document.querySelectorAll('div[class*=\"comment-item\"], div[class*=\"commentItem\"]').length," +
+                "  editable:!!document.querySelector('div[contenteditable=\"true\"]')," +
+                "  textarea:!!document.querySelector('textarea')," +
+                "  buttons:Array.from(document.querySelectorAll('button')).slice(0,8)" +
+                "    .map(b=>(b.textContent||'').trim().substring(0,30))" +
+                "})");
+            log.info("   🔍 评论区: {}", info);
         } catch (Exception e) {
             log.info("   🔍 评论区诊断失败: {}", e.getMessage());
         }
