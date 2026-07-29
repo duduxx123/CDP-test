@@ -88,4 +88,41 @@ public class DouyinController {
      */
     public record CommentsResponse(boolean success, String videoTitle, String videoUrl, List<CommentItem> comments) {
     }
+
+    /**
+     * 在抖音搜索关键词，点进指定视频，回复第 N 条一级评论。
+     *
+     * <pre>
+     * POST /api/douyin/reply
+     * Content-Type: application/json
+     * {"keyword": "编程学习", "replyText": "说得很好！", "videoIndex": 1, "commentIndex": 1}
+     * </pre>
+     */
+    @PostMapping("/reply")
+    public ReplyResponse replyToComment(@RequestBody ReplyRequest request) {
+
+        String keyword = request.keyword() != null && !request.keyword().isEmpty()
+                ? request.keyword() : "编程学习";
+        String replyText = request.replyText() != null && !request.replyText().isEmpty()
+                ? request.replyText() : "说得好！";
+        int videoIndex = request.videoIndex() > 0 ? request.videoIndex() : 1;
+        int commentIndex = request.commentIndex() > 0 ? request.commentIndex() : 1;
+
+        var result = douyinService.searchAndReplyToComment(keyword, replyText, videoIndex, commentIndex);
+        return new ReplyResponse(result.success(), result.videoTitle(), result.videoUrl(),
+                result.repliedToAuthor(), result.repliedToText(), result.replyText());
+    }
+
+    /**
+     * 回复请求。
+     */
+    public record ReplyRequest(String keyword, String replyText, int videoIndex, int commentIndex) {
+    }
+
+    /**
+     * 回复响应。
+     */
+    public record ReplyResponse(boolean success, String videoTitle, String videoUrl,
+                                String repliedToAuthor, String repliedToText, String replyText) {
+    }
 }

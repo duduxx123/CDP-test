@@ -35,6 +35,8 @@ public class DouyinService {
     public record DouyinResult(boolean success, String videoTitle, String videoUrl, String comment) {}
     public record CommentItem(String author, String text, String time) {}
     public record CommentsResult(boolean success, String videoTitle, String videoUrl, List<CommentItem> comments) {}
+    public record ReplyResult(boolean success, String videoTitle, String videoUrl,
+                              String repliedToAuthor, String repliedToText, String replyText) {}
 
     // ════ 公共方法 ════
 
@@ -161,6 +163,52 @@ public class DouyinService {
         } catch (Exception e) {
             log.error("❌ 获取评论失败: {}", e.getMessage(), e);
             return new CommentsResult(false, "(操作失败)", "", List.of());
+        } finally {
+            log.info("📌 标签页保持打开，可手动查看");
+        }
+    }
+
+    public ReplyResult searchAndReplyToComment(String keyword, String replyText, int videoIndex, int commentIndex) {
+        int vidIdx = Math.max(1, videoIndex);
+        int cmtIdx = Math.max(1, commentIndex);
+        Browser browser = chromeService.getBrowser();
+        var context = browser.contexts().getFirst();
+        Page page = context.newPage();
+
+        try {
+            searchDouyin(page, keyword);
+            if (isVerificationPage(page)) {
+                return new ReplyResult(false, "(验证码拦截)", page.url(), "", "", replyText);
+            }
+            String videoUrl = clickVideoByIndex(page, vidIdx);
+            waitForVideoPage(page);
+            if (isVerificationPage(page)) {
+                return new ReplyResult(false, "(验证码拦截)", page.url(), "", "", replyText);
+            }
+            if (!isLoggedIn(page)) {
+                return new ReplyResult(false, page.title(), page.url(), "(未登录)", "", replyText);
+            }
+            scrollToComments(page);
+            if (!waitForCommentItems(page)) {
+                return new ReplyResult(false, page.title(), videoUrl, "(无评论)", "", replyText);
+            }
+            debugCommentsDOM(page);
+
+            // 定位第 N 条一级评论并点击"回复"
+            String[] commentInfo = locateAndClickReply(page, cmtIdx);
+            String repliedToAuthor = commentInfo[0];
+            String repliedToText = commentInfo[1];
+            log.info("🎯 回复目标: @{} → {}", repliedToAuthor, repliedToText);
+
+            // 填写回复内容并提交
+            fillReplyInput(page, replyText);
+            submitReply(page);
+
+            log.info("✅ 抖音回复评论完成: @{} → {}", repliedToAuthor, replyText);
+            return new ReplyResult(true, page.title(), videoUrl, repliedToAuthor, repliedToText, replyText);
+        } catch (Exception e) {
+            log.error("❌ 抖音回复失败: {}", e.getMessage(), e);
+            return new ReplyResult(false, "(操作失败)", "", "", "", replyText);
         } finally {
             log.info("📌 标签页保持打开，可手动查看");
         }
@@ -789,6 +837,290 @@ public class DouyinService {
             log.info("   🔍 评论区: {}", info);
         } catch (Exception e) {
             log.info("   🔍 评论区诊断失败: {}", e.getMessage());
+        }
+    }
+
+    // ════ 回复评论 ════
+
+    /**
+     * 定位第 N 条一级评论，点击"回复"按钮，返回 [author, text]。
+     * 多策略 fallback：Playwright → JS 全局扫描 → hover 后点击。
+     */
+    private String[] locateAndClickReply(Page page, int commentIndex) {
+        log.info("🔍 定位第 {} 条一级评论的回复按钮...", commentIndex);
+
+        // 1) 找到第 N 个一级评论的 DOM 索引（需要 JS 过滤嵌套子回复）
+        int domIndex = findTopLevelCommentIndex(page, commentIndex);
+        var target = page.locator("[data-e2e=\"comment-item\"]").nth(domIndex);
+
+        // 2) 提取作者和正文（author 需要 JS 从 DOM 拿，Playwright nth().textContent 不可靠）
+        String author = extractAuthorByIndex(page, domIndex);
+        String commentText = extractCommentText(target);
+        log.info("   📝 @{}: {}", author, commentText);
+
+        // 3) 点击回复按钮
+        if (!clickReplyButton(target)) {
+            target.hover();
+            page.waitForTimeout(800);
+            if (!clickReplyButton(target)) {
+                throw new RuntimeException("无法找到第 " + commentIndex + " 条评论的回复按钮");
+            }
+        }
+
+        page.waitForTimeout(1500);
+        return new String[]{author, commentText};
+    }
+
+    /** 用 page.evaluate + 索引提取作者名（比 nth().locator.textContent() 可靠） */
+    private String extractAuthorByIndex(Page page, int domIndex) {
+        try {
+            Object name = page.evaluate(
+                "(idx) => {" +
+                "  var item = document.querySelectorAll('[data-e2e=\"comment-item\"]')[idx];" +
+                "  if (!item) return '';" +
+                // 取整个 item 的 textContent 的第一个词作为作者名
+                "  var full = (item.textContent||'').trim();" +
+                // 作者名通常是 textContent 中第一个 "..." 之前的部分
+                "  var dotIdx = full.indexOf('...');" +
+                "  if (dotIdx > 0) return full.substring(0, dotIdx).trim();" +
+                // 否则取 fullText 的第一个词（以空格/标点分隔）
+                "  return full.split(/[\\s,，。！!、]+/)[0] || '';" +
+                "}", domIndex);
+            return name != null ? name.toString().trim() : "";
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /** 找到第 targetN 个一级评论的 DOM 索引（跳过嵌套在父评论中的子回复） */
+    private int findTopLevelCommentIndex(Page page, int targetN) {
+        Object result = page.evaluate(
+            "(n) => {" +
+            "  var all = document.querySelectorAll('[data-e2e=\"comment-item\"]');" +
+            "  var count = 0;" +
+            "  for (var i = 0; i < all.length; i++) {" +
+            "    var p = all[i].parentElement, nested = false;" +
+            "    while (p && p !== document.body) {" +
+            "      if (p.getAttribute && p.getAttribute('data-e2e') === 'comment-item')" +
+            "        { nested = true; break; }" +
+            "      p = p.parentElement;" +
+            "    }" +
+            "    if (!nested) count++;" +
+            "    if (count === n) return i;" +
+            "  }" +
+            "  return -1;" +
+            "}", targetN);
+        int idx = result != null ? ((Number) result).intValue() : -1;
+        if (idx < 0) {
+            throw new RuntimeException("只有 " + (idx == -1 ? "?" : String.valueOf(idx)) + " 条一级评论，无法定位第 " + targetN + " 条");
+        }
+        return idx;
+    }
+
+    /** 在评论 item 内提取评论文本 */
+    private String extractCommentText(com.microsoft.playwright.Locator item) {
+        String[] sels = {
+                "[data-e2e=\"comment-content\"]",
+                "[class*=\"comment-content\"]",
+                "[class*=\"commentContent\"]",
+                "[class*=\"FduGc\"]",
+        };
+        for (String sel : sels) {
+            try {
+                var el = item.locator(sel).first();
+                if (el.count() > 0) {
+                    String t = el.textContent();
+                    if (t != null && !t.isBlank()) {
+                        t = t.trim();
+                        return t.length() > 120 ? t.substring(0, 120) : t;
+                    }
+                }
+            } catch (Exception ignored) {}
+        }
+        return "";
+    }
+
+    /** 在评论 item 内点击"回复"按钮 */
+    private boolean clickReplyButton(com.microsoft.playwright.Locator item) {
+        String[] replySels = {
+                "span:text-is(\"回复\")",
+                "button:text-is(\"回复\")",
+                ":text-is(\"回复\")",              // 任意元素精确匹配 "回复"
+                "[class*=\"reply-btn\"]",
+                "[class*=\"replyButton\"]",
+                "span:has-text(\"回复\")",
+        };
+        for (String sel : replySels) {
+            try {
+                var btn = item.locator(sel).first();
+                if (btn.count() > 0) {
+                    // 最后几个选择器用 force click
+                    boolean force = sel.startsWith("[class") || sel.startsWith("span:has");
+                    btn.click(new com.microsoft.playwright.Locator.ClickOptions().setForce(force));
+                    log.info("   ✅ 已点击回复按钮 ({})", sel);
+                    return true;
+                }
+            } catch (Exception ignored) {}
+        }
+        return false;
+    }
+
+    /**
+     * 填写回复内容。点击"回复"后会出现第二个 contenteditable，用这个新出现的输入框。
+     */
+    private void fillReplyInput(Page page, String replyText) {
+        log.info("   ✍️ 填写回复: {}", replyText);
+
+        // 等待第二个 contenteditable 出现（点击"回复"后 Douyin 可能异步创建输入框）
+        int contentEditableCount = 0;
+        for (int w = 0; w < 10; w++) {
+            page.waitForTimeout(400);
+            try {
+                contentEditableCount = page.locator("div[contenteditable=\"true\"]").count();
+                if (contentEditableCount >= 2) break;
+            } catch (Exception ignored) {}
+        }
+        log.info("   contenteditable 数量: {}", contentEditableCount);
+
+        // 策略1: 找到新增的 contenteditable（最后一个就是回复框）
+        try {
+            var all = page.locator("div[contenteditable=\"true\"]");
+            int count = all.count();
+            if (count >= 2) {
+                var replyBox = all.last();
+                replyBox.click();
+                page.waitForTimeout(300);
+                replyBox.fill(replyText);
+                log.info("   ✅ 回复已填入 (第 {} 个 contenteditable)", count);
+                page.waitForTimeout(500);
+                return;
+            }
+            if (count == 1) {
+                // 只有1个，可能就是回复框（主评论框没出现）
+                var box = all.first();
+                box.click();
+                page.waitForTimeout(300);
+                box.fill(replyText);
+                log.info("   ✅ 回复已填入 (唯一 contenteditable)");
+                page.waitForTimeout(500);
+                return;
+            }
+        } catch (Exception ignored) {}
+
+        // 策略2: 在评论区容器内找 contenteditable
+        try {
+            String[] containers = {"[data-e2e=\"comment-list\"]", "div[class*=\"comment-mainContent\"]",
+                    "div[class*=\"comment-container\"]", "#douyin-right-container"};
+            for (String container : containers) {
+                try {
+                    var box = page.locator(container + " div[contenteditable=\"true\"]").last();
+                    if (box.count() > 0) {
+                        box.click();
+                        page.waitForTimeout(300);
+                        box.fill(replyText);
+                        log.info("   ✅ 回复已填入 (容器: {})", container);
+                        page.waitForTimeout(500);
+                        return;
+                    }
+                } catch (Exception ignored) {}
+            }
+        } catch (Exception ignored) {}
+
+        // 策略3: textarea 兜底
+        try {
+            var ta = page.locator("textarea").last();
+            if (ta.count() > 0) {
+                ta.click();
+                page.waitForTimeout(300);
+                ta.fill(replyText);
+                log.info("   ✅ 回复已填入 (textarea)");
+                page.waitForTimeout(500);
+                return;
+            }
+        } catch (Exception ignored) {}
+
+        // 策略4: 键盘逐字输入兜底
+        log.info("   使用键盘逐字输入...");
+        humanType(page, replyText);
+    }
+
+    /**
+     * 提交回复：Enter → 发送按钮 → 全局 Enter。
+     */
+    private void submitReply(Page page) {
+        page.waitForTimeout(800);
+        log.info("   🚀 提交回复...");
+
+        // 策略1: 最后一个 contenteditable 里按 Enter（抖音最可靠的提交方式）
+        try {
+            var all = page.locator("div[contenteditable=\"true\"]");
+            int count = all.count();
+            if (count > 0) {
+                all.last().press("Enter");
+                log.info("   ✅ Enter 已发送 (第 {} 个 contenteditable)", count);
+                page.waitForTimeout(2000);
+                return;
+            }
+        } catch (Exception ignored) {}
+
+        // 策略2: 在所有 contenteditable 里尝试 Enter
+        String[] commentBoxSels = {
+                "[data-e2e=\"comment-list\"] div[contenteditable=\"true\"]",
+                "div[class*=\"comment-mainContent\"] div[contenteditable=\"true\"]",
+                "div[class*=\"comment-container\"] div[contenteditable=\"true\"]",
+        };
+        for (String sel : commentBoxSels) {
+            try {
+                var boxes = page.locator(sel);
+                if (boxes.count() > 0) {
+                    boxes.last().press("Enter");
+                    log.info("   ✅ Enter 已发送 ({})", sel);
+                    page.waitForTimeout(2000);
+                    return;
+                }
+            } catch (Exception ignored) {}
+        }
+
+        // 策略3: 评论区内的"发送"/"发布"按钮
+        String[] containers = {"[data-e2e=\"comment-list\"]", "div[class*=\"comment-mainContent\"]",
+                "div[class*=\"comment-container\"]", "#douyin-right-container"};
+        for (String container : containers) {
+            for (String t : new String[]{"发送", "发布"}) {
+                try {
+                    var btns = page.locator(container + " button:text-is(\"" + t + "\"), " +
+                            container + " span:text-is(\"" + t + "\"), " +
+                            container + " [class*=\"submit\"], " +
+                            container + " [class*=\"send\"]");
+                    // 取最后一个按钮（回复的发送按钮通常是后出现的）
+                    if (btns.count() > 0) {
+                        var btn = btns.last();
+                        if (btn.isVisible() && btn.isEnabled()) {
+                            btn.evaluate("el => el.click()");
+                            log.info("   ✅ 原生点击发送按钮 ({}: {}, index={})", container, t, btns.count() - 1);
+                            page.waitForTimeout(2000);
+                            return;
+                        }
+                    }
+                } catch (Exception ignored) {}
+            }
+        }
+
+        // 策略4: 全局 Enter 兜底
+        log.info("   ⌨️ 全局 Enter 兜底");
+        page.keyboard().press("Enter");
+        page.waitForTimeout(2000);
+    }
+
+    /** 调试回复相关 DOM 结构 */
+    private void debugReplyDOM(Page page, int commentIndex) {
+        try {
+            int totalItems = page.locator("[data-e2e=\"comment-item\"]").count();
+            int editableCount = page.locator("div[contenteditable=\"true\"]").count();
+            int replyBtns = page.locator(":text-is(\"回复\")").count();
+            log.info("   🔍 回复调试: items={}, contenteditable={}, replyBtns={}, targetIdx={}",
+                    totalItems, editableCount, replyBtns, commentIndex);
+        } catch (Exception e) {
+            log.info("   🔍 回复调试失败: {}", e.getMessage());
         }
     }
 }
