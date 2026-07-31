@@ -29,3 +29,8 @@ app:
     typing-delay-ms: 100
     # 评论提取最大滚动轮数
     max-scroll-rounds: 20
+    dm:
+      # 发送私信后等待确认时间（毫秒）
+      send-wait-ms: 2000
+      # 私信输入框等待超时（毫秒）
+      input-timeout-ms: 10000

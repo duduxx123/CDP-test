@@ -14,5 +14,7 @@ public record AppConfig(
 ) {
     public record Chrome(int port, String executable) {}
     public record Search(String query, int count) {}
-    public record Douyin(boolean checkLogin, int typingDelayMs, int maxScrollRounds) {}
+    public record Douyin(boolean checkLogin, int typingDelayMs, int maxScrollRounds, Dm dm) {
+        public record Dm(int sendWaitMs, int inputTimeoutMs) {}
+    }
 }

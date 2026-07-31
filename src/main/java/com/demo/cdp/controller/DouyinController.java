@@ -125,4 +125,43 @@ public class DouyinController {
     public record ReplyResponse(boolean success, String videoTitle, String videoUrl,
                                 String repliedToAuthor, String repliedToText, String replyText) {
     }
+
+    /**
+     * 向指定抖音用户发送私信（用户 ID 从评论区 CommentItem.userId 获取）。
+     *
+     * <pre>
+     * POST /api/douyin/dm/send
+     * Content-Type: application/json
+     * {"userId": "MS4wLjABAAAA...", "message": "你好，看了你的评论..."}
+     * </pre>
+     */
+    @PostMapping("/dm/send")
+    public DmSendResponse sendDm(@RequestBody DmSendRequest request) {
+
+        String userId = request.userId() != null && !request.userId().isEmpty()
+                ? request.userId() : "";
+        String message = request.message() != null && !request.message().isEmpty()
+                ? request.message() : "你好！";
+
+        if (userId.isEmpty()) {
+            return new DmSendResponse(false, "", "", message, "用户 ID 不能为空");
+        }
+
+        var result = douyinService.sendDmByUserId(userId, message);
+        return new DmSendResponse(result.success(), result.targetUserName(), result.targetUserId(),
+                result.message(), result.errorReason());
+    }
+
+    /**
+     * 私信发送请求。
+     */
+    public record DmSendRequest(String userId, String message) {
+    }
+
+    /**
+     * 私信发送响应。
+     */
+    public record DmSendResponse(boolean success, String targetUserName, String targetUserId,
+                                  String message, String errorReason) {
+    }
 }

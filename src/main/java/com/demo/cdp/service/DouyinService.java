@@ -1,5 +1,6 @@
 package com.demo.cdp.service;
 
+import com.demo.cdp.config.AppConfig;
 import com.microsoft.playwright.Browser;
 import com.microsoft.playwright.Page;
 import com.microsoft.playwright.options.WaitForSelectorState;
@@ -15,7 +16,7 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * 抖音网页版自动操作 —— 搜索 + 点指定视频 + 评论。
+ * 抖音网页版自动操作 —— 搜索 + 点指定视频 + 评论 + 私信。
  * <p>
  * 优先使用 Playwright locator API，JS evaluate 仅用于调试和无法用选择器表达的逻辑。
  */
@@ -25,18 +26,22 @@ public class DouyinService {
     private static final Logger log = LoggerFactory.getLogger(DouyinService.class);
 
     private final ChromeLifecycleService chromeService;
+    private final AppConfig config;
 
-    public DouyinService(ChromeLifecycleService chromeService) {
+    public DouyinService(ChromeLifecycleService chromeService, AppConfig config) {
         this.chromeService = chromeService;
+        this.config = config;
     }
 
     // ════ 记录类型 ════
 
     public record DouyinResult(boolean success, String videoTitle, String videoUrl, String comment) {}
-    public record CommentItem(String author, String text, String time) {}
+    public record CommentItem(String author, String text, String time, String userId) {}
     public record CommentsResult(boolean success, String videoTitle, String videoUrl, List<CommentItem> comments) {}
     public record ReplyResult(boolean success, String videoTitle, String videoUrl,
                               String repliedToAuthor, String repliedToText, String replyText) {}
+    public record DmResult(boolean success, String targetUserName, String targetUserId,
+                            String message, String errorReason) {}
 
     // ════ 公共方法 ════
 
@@ -230,6 +235,67 @@ public class DouyinService {
         System.out.println("=".repeat(60));
     }
 
+    /**
+     * 向指定抖音用户发送私信。
+     *
+     * @param userId  目标用户 ID（从评论区 CommentItem.userId 获取）
+     * @param message 私信内容
+     * @return 发送结果
+     */
+    public DmResult sendDmByUserId(String userId, String message) {
+        Browser browser = chromeService.getBrowser();
+        var context = browser.contexts().getFirst();
+        Page page = context.newPage();
+
+        try {
+            // 1. 导航到用户主页（DOMContentLoaded 即可，不等所有资源）
+            String profileUrl = "https://www.douyin.com/user/" + userId;
+            log.info("📨 导航到用户主页: {}", profileUrl);
+            page.navigate(profileUrl, new Page.NavigateOptions()
+                    .setWaitUntil(com.microsoft.playwright.options.WaitUntilState.DOMCONTENTLOADED));
+            waitForUserProfilePage(page);
+
+            // 2. 检查用户是否存在（title 为空或缺少关键按钮 = 用户不存在）
+            if (isUserNotExist(page)) {
+                return new DmResult(false, "(用户不存在)", userId, message, "用户不存在或已注销");
+            }
+
+            // 3. 检查验证码
+            if (isVerificationPage(page)) {
+                return new DmResult(false, "", userId, message, "验证码拦截");
+            }
+
+            // 3. 检查登录
+            if (!isLoggedIn(page)) {
+                return new DmResult(false, page.title(), userId, message, "未登录");
+            }
+
+            // 4. 提取用户名
+            String targetUserName = extractUsernameFromProfile(page);
+            log.info("   👤 目标用户: {}", targetUserName);
+
+            // 5. 点击私信按钮
+            clickPrivateMessageButton(page);
+
+            // 6. 等待聊天面板
+            waitForDmChatPanel(page);
+            debugDmPanelDOM(page);
+
+            // 7. 填写（测试阶段：仅填入输入框，不发送）
+            fillDmInput(page, message);
+            // TODO: 测试完成后取消注释
+            // submitDm(page);
+
+            log.info("✅ 抖音私信发送完成: {} → {}", targetUserName, message);
+            return new DmResult(true, targetUserName, userId, message, null);
+        } catch (Exception e) {
+            log.error("❌ 抖音私信发送失败: {}", e.getMessage(), e);
+            return new DmResult(false, "(操作失败)", userId, message, e.getMessage());
+        } finally {
+            log.info("📌 标签页保持打开，可手动查看");
+        }
+    }
+
     // ════ 搜索 & 选择视频 ════
 
     private void searchDouyin(Page page, String keyword) {
@@ -376,14 +442,37 @@ public class DouyinService {
             } catch (Exception ignored) {}
         }
 
-        // 检查是否有显式登录按钮
+        // 检查是否有显式登录按钮（存在 = 未登录）
         try {
             var loginBtn = page.locator("span:text-is(\"登录\"), button:has-text(\"登录\")").first();
-            if (loginBtn.count() > 0 && loginBtn.isVisible()) return false;
+            if (loginBtn.count() > 0 && loginBtn.isVisible()) {
+                log.info("   检测到登录按钮，未登录");
+                return false;
+            }
         } catch (Exception ignored) {}
 
-        // 在视频页上保守返回 true
-        return page.url().contains("/video/");
+        // 已登录标志：页面上有"私信"、"关注"、"已关注"等按钮（仅登录用户可见）
+        String[] loggedInIndicators = {
+                "span:text-is(\"私信\")",
+                "button:has-text(\"私信\")",
+                "span:text-is(\"已关注\")",
+                "button:has-text(\"已关注\")",
+                "span:text-is(\"关注\")",
+                "button:has-text(\"关注\")",
+        };
+        for (String sel : loggedInIndicators) {
+            try {
+                var el = page.locator(sel).first();
+                if (el.count() > 0 && el.isVisible()) {
+                    log.info("✅ 已登录抖音 (登录标志: {})", sel);
+                    return true;
+                }
+            } catch (Exception ignored) {}
+        }
+
+        // 在视频页或用户主页上保守返回 true
+        String url = page.url();
+        return url.contains("/video/") || url.contains("/user/") || url.contains("/im/");
     }
 
     // ════ 评论区 ════
@@ -447,7 +536,7 @@ public class DouyinService {
             }
             if (items.count() == 0) return List.of();
 
-            // JS: 只做 DOM 查询，返回原始字段 [authorFromLink, fullTextContent, timeFromRegex, bodyText]
+            // JS: 只做 DOM 查询，返回原始字段 [authorFromLink, fullTextContent, timeFromRegex, bodyText, userId]
             List<List<String>> raw = (List<List<String>>) page.evaluate(
                 "() => {" +
                 "  var all = document.querySelectorAll('[data-e2e=\"comment-item\"], " +
@@ -462,8 +551,14 @@ public class DouyinService {
                 "    var full = (item.textContent || '').trim();" +
                 // 作者链接
                 "    var author = '';" +
+                "    var userId = '';" +
                 "    var ua = item.querySelector('a[href*=\"/user/\"]');" +
-                "    if (ua) author = (ua.textContent || '').trim();" +
+                "    if (ua) {" +
+                "      author = (ua.textContent || '').trim();" +
+                "      var href = ua.getAttribute('href') || '';" +
+                "      var uidMatch = href.match(/\\/user\\/([^/?]+)/);" +
+                "      if (uidMatch) userId = uidMatch[1];" +
+                "    }" +
                 // 时间
                 "    var tm = '';" +
                 "    var m = full.match(/\\d+\\s*(分钟前|小时前|天前|秒前|周前|月前|年前)|刚刚|\\d+-\\d+-\\d+/);" +
@@ -473,7 +568,7 @@ public class DouyinService {
                 "    var be = item.querySelector('[data-e2e=\"comment-content\"], " +
                 "      [class*=\"comment-content\"], [class*=\"FduGc\"]');" +
                 "    if (be) body = (be.textContent || '').trim();" +
-                "    return [author, full, tm, body];" +
+                "    return [author, full, tm, body, userId];" +
                 "  }).filter(function(r) { return r !== null; });" +
                 "}");
 
@@ -491,11 +586,12 @@ public class DouyinService {
 
             List<CommentItem> result = new ArrayList<>();
             for (List<String> row : raw) {
-                if (row.size() < 4) continue;
+                if (row.size() < 5) continue;
                 String author = nz(row.get(0));
                 String fullText = nz(row.get(1));
                 String time = nz(row.get(2));
                 String bodyText = nz(row.get(3));
+                String userId = nz(row.get(4));
 
                 // 过滤 "X分享回复" / "展开X条回复"
                 if (noisePattern.matcher(fullText).matches()) continue;
@@ -541,7 +637,7 @@ public class DouyinService {
                 if (noisePattern.matcher(text).matches()) continue;
                 if (text.isEmpty() && author.isEmpty()) continue;
 
-                result.add(new CommentItem(author, text, time));
+                result.add(new CommentItem(author, text, time, userId));
             }
             return result;
         } catch (Exception e) {
@@ -803,6 +899,424 @@ public class DouyinService {
         log.info("   ⌨️ 全局 Enter");
         page.keyboard().press("Enter");
         page.waitForTimeout(2000);
+    }
+
+    // ════ 私信 ════
+
+    /** 检测用户是否不存在（title 为空 + 缺少关注/私信按钮 = 不存在的用户）。 */
+    private boolean isUserNotExist(Page page) {
+        // 检查 title 是否为空
+        String title = page.title();
+        if (title == null || title.isEmpty()) {
+            log.info("   ⚠️ 页面标题为空，用户可能不存在");
+            return true;
+        }
+
+        // 检查页面上是否有"用户不存在"文本
+        try {
+            var notFound = page.locator(":text-matches(\"用户[不未]存在|该用户已注销|找不到用户|页面不存在\", \"i\")").first();
+            if (notFound.count() > 0 && notFound.isVisible()) {
+                log.info("   ⚠️ 页面显示用户不存在");
+                return true;
+            }
+        } catch (Exception ignored) {}
+
+        // 检查是否有 profile 相关按钮（关注/私信/分享主页），没有则用户可能不存在
+        try {
+            int profileBtnCount = page.locator(
+                    "button:has-text(\"关注\"), button:has-text(\"私信\"), button:has-text(\"分享主页\")").count();
+            if (profileBtnCount == 0) {
+                log.info("   ⚠️ 未找到任何 profile 按钮，用户可能不存在");
+                return true;
+            }
+        } catch (Exception ignored) {}
+
+        return false;
+    }
+
+    /** 等待用户主页加载完成。 */
+    private void waitForUserProfilePage(Page page) {
+        // 1) 先等 URL 匹配（最快，navigate 后 URL 通常已正确）
+        try {
+            page.waitForURL("**/user/**", new Page.WaitForURLOptions().setTimeout(5000));
+            log.info("   ✅ URL 已匹配 /user/: {}", page.url());
+        } catch (Exception ignored) {
+            log.info("   ⏳ URL 未匹配 /user/，当前: {}", page.url());
+        }
+
+        // 2) 等网络空闲（短超时，Douyin 后台请求太多）
+        try {
+            page.waitForLoadState(com.microsoft.playwright.options.LoadState.NETWORKIDLE,
+                    new Page.WaitForLoadStateOptions().setTimeout(3000));
+            log.info("   ✅ 网络空闲");
+        } catch (Exception ignored) {}
+
+        // 3) 快速检查 profile 选择器（短超时）
+        String[] profileSelectors = {
+                "[data-e2e=\"user-profile\"]",
+                "div[class*=\"profile\"]",
+                "div[class*=\"user-info\"]",
+        };
+        for (String sel : profileSelectors) {
+            try {
+                page.waitForSelector(sel, new Page.WaitForSelectorOptions().setTimeout(2000));
+                log.info("   ✅ 用户主页元素 ({})", sel);
+                break;
+            } catch (Exception ignored) {}
+        }
+
+        debugUserProfileDOM(page);
+    }
+
+    /** 从用户主页提取用户名。 */
+    private String extractUsernameFromProfile(Page page) {
+        String[] nameSelectors = {
+                "[data-e2e=\"user-name\"]",
+                "[data-e2e=\"user-title\"]",
+                "span[class*=\"nickname\"]",
+                "h1[class*=\"name\"]",
+                "div[class*=\"nickname\"]",
+                "div[class*=\"user-name\"]",
+        };
+        for (String sel : nameSelectors) {
+            try {
+                var el = page.locator(sel).first();
+                if (el.count() > 0) {
+                    String name = el.textContent();
+                    if (name != null && !name.isBlank()) {
+                        return name.trim();
+                    }
+                }
+            } catch (Exception ignored) {}
+        }
+
+        // 兜底1：从 document.title 提取（"用户名 的抖音 - 抖音"）
+        String title = page.title();
+        if (title != null && !title.isEmpty()) {
+            var m = java.util.regex.Pattern.compile("^(.+?)(的抖音|的主页|抖音| - )").matcher(title);
+            if (m.find()) {
+                return m.group(1).trim();
+            }
+        }
+
+        // 兜底2：Playwright 找 h1/h2
+        for (String tag : new String[]{"h1", "h2"}) {
+            try {
+                var el = page.locator(tag).first();
+                if (el.count() > 0) {
+                    String text = el.textContent();
+                    if (text != null && !text.isBlank()) return text.trim();
+                }
+            } catch (Exception ignored) {}
+        }
+
+        return title != null && !title.isEmpty() ? title : "(未知用户)";
+    }
+
+    /** 点击用户主页的"私信"按钮 —— 多策略 fallback。 */
+    private void clickPrivateMessageButton(Page page) {
+        log.info("🖱️  定位私信按钮...");
+        debugUserProfileDOM(page);
+
+        // 策略 1: data-e2e 选择器
+        String[] primarySels = {
+                "[data-e2e=\"user-private-message\"]",
+                "[data-e2e=\"private-message\"]",
+                "[data-e2e=\"user-follow-btn\"] + button",
+        };
+        for (String sel : primarySels) {
+            try {
+                var btn = page.locator(sel).first();
+                if (btn.count() > 0 && btn.isVisible()) {
+                    btn.click();
+                    log.info("   ✅ 已点击 ({})", sel);
+                    page.waitForTimeout(2000);
+                    return;
+                }
+            } catch (Exception ignored) {}
+        }
+
+        // 策略 2: 精确文本匹配
+        String[] textSels = {
+                "span:text-is(\"私信\")",
+                "button:text-is(\"私信\")",
+                "div:text-is(\"私信\")",
+        };
+        for (String sel : textSels) {
+            try {
+                var btn = page.locator(sel).first();
+                if (btn.count() > 0 && btn.isVisible()) {
+                    btn.click(new com.microsoft.playwright.Locator.ClickOptions().setForce(true));
+                    log.info("   ✅ 已点击 ({})", sel);
+                    page.waitForTimeout(2000);
+                    return;
+                }
+            } catch (Exception ignored) {}
+        }
+
+        // 策略 3: 模糊文本匹配（has-text）
+        String[] fuzzySels = {
+                "span:has-text(\"私信\")",
+                "button:has-text(\"私信\")",
+                "[class*=\"private-message\"]",
+                "[class*=\"privateMessage\"]",
+                "[class*=\"chat-btn\"]",
+                "[class*=\"chatButton\"]",
+        };
+        for (String sel : fuzzySels) {
+            try {
+                var btn = page.locator(sel).first();
+                if (btn.count() > 0 && btn.isVisible()) {
+                    btn.click(new com.microsoft.playwright.Locator.ClickOptions().setForce(true));
+                    log.info("   ✅ 已点击 ({})", sel);
+                    page.waitForTimeout(2000);
+                    return;
+                }
+            } catch (Exception ignored) {}
+        }
+
+        // 策略 4: hover 头像区域后再找（某些私信按钮在 hover 后才出现）
+        try {
+            var avatar = page.locator("[data-e2e=\"user-avatar\"], img[class*=\"avatar\"]").first();
+            if (avatar.count() > 0) {
+                avatar.hover();
+                page.waitForTimeout(1500);
+                for (String sel : textSels) {
+                    try {
+                        var btn = page.locator(sel).first();
+                        if (btn.count() > 0 && btn.isVisible()) {
+                            btn.click(new com.microsoft.playwright.Locator.ClickOptions().setForce(true));
+                            log.info("   ✅ hover 后点击 ({})", sel);
+                            page.waitForTimeout(2000);
+                            return;
+                        }
+                    } catch (Exception ignored) {}
+                }
+            }
+        } catch (Exception ignored) {}
+
+        // 策略 5: Playwright filter 精确匹配可见元素
+        for (String tag : new String[]{"span", "button", "div", "a"}) {
+            try {
+                var matches = page.locator(tag)
+                        .filter(new com.microsoft.playwright.Locator.FilterOptions()
+                                .setHasText(java.util.regex.Pattern.compile("^私信$")))
+                        .filter(new com.microsoft.playwright.Locator.FilterOptions()
+                                .setHasNot(page.locator("[class*=\"semi\"]")))  // 排除嵌套子元素
+                        .all();
+                for (var el : matches) {
+                    if (el.isVisible()) {
+                        el.click(new com.microsoft.playwright.Locator.ClickOptions().setForce(true));
+                        log.info("   ✅ Playwright filter 点击: <{}>", tag);
+                        page.waitForTimeout(2000);
+                        return;
+                    }
+                }
+            } catch (Exception ignored) {}
+        }
+
+        throw new RuntimeException("无法找到私信按钮：该用户可能关闭了私信功能");
+    }
+
+    /** 等待聊天面板和输入框出现。 */
+    private void waitForDmChatPanel(Page page) {
+        log.info("💬 等待聊天面板...");
+        int timeoutMs = 10000;
+        try {
+            timeoutMs = config.douyin().dm().inputTimeoutMs();
+        } catch (Exception ignored) {}
+
+        long deadline = System.currentTimeMillis() + timeoutMs;
+
+        String[] inputSels = {
+                "div[contenteditable=\"true\"]",
+                "textarea",
+                "[class*=\"chat-input\"] div[contenteditable=\"true\"]",
+                "[class*=\"im-input\"] div[contenteditable=\"true\"]",
+                "[class*=\"message-input\"]",
+        };
+
+        while (System.currentTimeMillis() < deadline) {
+            // 检查是否跳转到了 IM 页面
+            if (page.url().contains("/im/") || page.url().contains("/chat/")) {
+                log.info("   ✅ 已跳转到 IM/聊天页面: {}", page.url());
+                page.waitForTimeout(2000);
+            }
+
+            for (String sel : inputSels) {
+                try {
+                    var el = page.locator(sel).first();
+                    if (el.count() > 0 && el.isVisible()) {
+                        log.info("   ✅ 聊天输入框已出现 ({})", sel);
+                        page.waitForTimeout(1000);
+                        return;
+                    }
+                } catch (Exception ignored) {}
+            }
+            page.waitForTimeout(500);
+        }
+
+        log.warn("   ⚠️ 聊天面板超时 ({}ms)，继续尝试操作", timeoutMs);
+    }
+
+    /** 填写私信内容。 */
+    private void fillDmInput(Page page, String message) {
+        log.info("✍️  填写私信: {}", message);
+
+        // 策略 1: 最后一个 contenteditable（聊天输入框通常是页面上最后一个）
+        try {
+            var all = page.locator("div[contenteditable=\"true\"]");
+            int count = all.count();
+            if (count > 0) {
+                var box = all.last();
+                box.click();
+                page.waitForTimeout(300);
+                box.fill(message);
+                log.info("   ✅ 已填入 (第 {} 个 contenteditable)", count);
+                page.waitForTimeout(500);
+                return;
+            }
+        } catch (Exception ignored) {}
+
+        // 策略 2: IM 相关选择器
+        String[] imInputSels = {
+                "[class*=\"chat-input\"] div[contenteditable=\"true\"]",
+                "[class*=\"im-input\"] div[contenteditable=\"true\"]",
+                "[class*=\"im-editor\"] div[contenteditable=\"true\"]",
+                "[class*=\"message-editor\"] div[contenteditable=\"true\"]",
+        };
+        for (String sel : imInputSels) {
+            try {
+                var box = page.locator(sel).first();
+                if (box.count() > 0 && box.isVisible()) {
+                    box.click();
+                    page.waitForTimeout(300);
+                    box.fill(message);
+                    log.info("   ✅ 已填入 ({})", sel);
+                    page.waitForTimeout(500);
+                    return;
+                }
+            } catch (Exception ignored) {}
+        }
+
+        // 策略 3: textarea 兜底
+        try {
+            var ta = page.locator("textarea").last();
+            if (ta.count() > 0 && ta.isVisible()) {
+                ta.click();
+                page.waitForTimeout(300);
+                ta.fill(message);
+                log.info("   ✅ 已填入 (textarea)");
+                page.waitForTimeout(500);
+                return;
+            }
+        } catch (Exception ignored) {}
+
+        // 策略 4: 键盘逐字输入兜底
+        log.info("   使用键盘逐字输入...");
+        humanType(page, message);
+    }
+
+    /** 提交私信：Enter → 发送按钮 → 全局 Enter。 */
+    private void submitDm(Page page) {
+        page.waitForTimeout(800);
+        log.info("🚀 提交私信...");
+
+        // 策略 1: 最后一个 contenteditable 里按 Enter
+        try {
+            var all = page.locator("div[contenteditable=\"true\"]");
+            int count = all.count();
+            if (count > 0) {
+                all.last().press("Enter");
+                log.info("   ✅ Enter 已发送 (第 {} 个 contenteditable)", count);
+                page.waitForTimeout(2000);
+                return;
+            }
+        } catch (Exception ignored) {}
+
+        // 策略 2: IM 面板内的 Enter
+        String[] imInputSels = {
+                "[class*=\"chat-input\"] div[contenteditable=\"true\"]",
+                "[class*=\"im-input\"] div[contenteditable=\"true\"]",
+                "[class*=\"im-editor\"] div[contenteditable=\"true\"]",
+        };
+        for (String sel : imInputSels) {
+            try {
+                var boxes = page.locator(sel);
+                if (boxes.count() > 0) {
+                    boxes.last().press("Enter");
+                    log.info("   ✅ Enter 已发送 ({})", sel);
+                    page.waitForTimeout(2000);
+                    return;
+                }
+            } catch (Exception ignored) {}
+        }
+
+        // 策略 3: "发送"按钮
+        String[] containerSels = {
+                "[class*=\"chat-input\"]",
+                "[class*=\"im-panel\"]",
+                "[class*=\"im-footer\"]",
+                "[class*=\"message-editor\"]",
+        };
+        for (String container : containerSels) {
+            for (String t : new String[]{"发送"}) {
+                try {
+                    var btn = page.locator(container + " button:has-text(\"" + t + "\"), " +
+                            container + " span:text-is(\"" + t + "\"), " +
+                            container + " [class*=\"send\"], " +
+                            container + " [class*=\"submit\"]").first();
+                    if (btn.count() > 0 && btn.isVisible() && btn.isEnabled()) {
+                        btn.evaluate("el => el.click()");
+                        log.info("   ✅ 原生点击发送 ({}: {})", container, t);
+                        page.waitForTimeout(2000);
+                        return;
+                    }
+                } catch (Exception ignored) {}
+            }
+        }
+
+        // 策略 4: 全局 Enter
+        log.info("   ⌨️ 全局 Enter 兜底");
+        page.keyboard().press("Enter");
+        page.waitForTimeout(2000);
+    }
+
+    /** 调试用户主页 DOM 结构。 */
+    private void debugUserProfileDOM(Page page) {
+        try {
+            String info = (String) page.evaluate(
+                    "() => JSON.stringify({" +
+                    "  url: location.href," +
+                    "  title: document.title," +
+                    "  dmTextElements: Array.from(document.querySelectorAll('span, button, div'))" +
+                    "    .filter(el => (el.textContent || '').trim() === '私信' && el.offsetParent !== null)" +
+                    "    .map(el => el.tagName + '#' + (el.id || '') + '.' + (el.className || '').substring(0, 40))," +
+                    "  buttons: Array.from(document.querySelectorAll('button')).slice(0, 10)" +
+                    "    .map(b => (b.textContent || '').trim().substring(0, 30))," +
+                    "  contentEditableCount: document.querySelectorAll('div[contenteditable=\"true\"]').length" +
+                    "})");
+            log.info("   🔍 用户主页: {}", info);
+        } catch (Exception e) {
+            log.info("   🔍 用户主页诊断失败: {}", e.getMessage());
+        }
+    }
+
+    /** 调试私信面板 DOM 结构。 */
+    private void debugDmPanelDOM(Page page) {
+        try {
+            String info = (String) page.evaluate(
+                    "() => JSON.stringify({" +
+                    "  url: location.href," +
+                    "  contentEditableCount: document.querySelectorAll('div[contenteditable=\"true\"]').length," +
+                    "  textareaCount: document.querySelectorAll('textarea').length," +
+                    "  buttons: Array.from(document.querySelectorAll('button')).slice(0, 10)" +
+                    "    .map(b => (b.textContent || '').trim().substring(0, 30))" +
+                    "})");
+            log.info("   🔍 私信面板: {}", info);
+        } catch (Exception e) {
+            log.info("   🔍 私信面板诊断失败: {}", e.getMessage());
+        }
     }
 
     // ════ 调试方法 ════
